@@ -1,0 +1,27 @@
+{
+  "shapeId": "shape:1e850f77-bd44-4da9-aa6b-d87862ea3528",
+  "widgetId": "1e850f77-bd44-4da9-aa6b-d87862ea3528",
+  "templateHandle": "news-without-doom-library",
+  "templateName": "News Without Doom Library",
+  "icon": {
+    "type": "react-icon",
+    "value": "Gi:GiNewspaper"
+  },
+  "position": {
+    "x": 0,
+    "y": 0
+  },
+  "size": {
+    "w": 400,
+    "h": 300
+  },
+  "rotation": 0,
+  "opacity": 1,
+  "isLocked": false,
+  "color": "black",
+  "zoomScale": 1,
+  "meta": {},
+  "parentId": "page:5psH-fiZdYsoDbLBXC7_W",
+  "index": "a1",
+  "lastChangedClock": 3
+}

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "deepspace-dev",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["deepspace", "dev"],
+      "port": 5173
+    }
+  ]
+}

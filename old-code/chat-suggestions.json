@@ -1,0 +1,6 @@
+[
+  { "label": "What's in tech news today?", "prompt": "Give me a summary of what's happening in tech news right now." },
+  { "label": "How does the negativity filter work?", "prompt": "Explain what the Off, Light, and Strict negativity filter options do." },
+  { "label": "What sources are used?", "prompt": "Which news sources does this app pull from?" },
+  { "label": "How do I save articles?", "prompt": "How do I save an article for later and where do I find my saved articles?" }
+]
