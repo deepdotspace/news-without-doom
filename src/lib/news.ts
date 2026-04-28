@@ -33,6 +33,16 @@ export interface EnrichedHeadline extends RawHeadline {
   contextLine: string
   shortSummary: string
   negativity: 'low' | 'medium' | 'high'
+  /**
+   * Whether the LLM judged this item to genuinely fit the requested
+   * topic. Used to filter off-topic noise from catch-all feeds (e.g.
+   * The Verge's all-content feed leaks gaming / film / random into
+   * the Science topic).
+   *
+   * Defaults to true on fallback so we never accidentally drop
+   * everything when the LLM call is unavailable.
+   */
+  relevant: boolean
 }
 
 export interface BriefBullet {
@@ -58,28 +68,65 @@ export interface SavedHeadline extends EnrichedHeadline {
 // ─── Static config ───────────────────────────────────────────────────────
 
 export const TOPICS = ['Tech', 'Business', 'Science', 'Markets', 'Sports', 'Local'] as const
-export const FILTER_OPTIONS = ['Off', 'Light', 'Strict'] as const
 
+/**
+ * Negativity filter labels — on-brand and self-explanatory:
+ *   - "All"       → no filter, show everything
+ *   - "Less doom" → hide highly-negative items
+ *   - "No doom"   → only show items the LLM scored as low-negativity
+ */
+export const FILTER_OPTIONS = ['All', 'Less doom', 'No doom'] as const
+export type FilterOption = (typeof FILTER_OPTIONS)[number]
+
+/**
+ * Trusted source set.
+ *
+ *   • Reuters: removed. They retired their public RSS in June 2020
+ *     (every URL on `feeds.reuters.com` and `reutersagency.com/feed/...`
+ *     returns DNS-fail or 404). Reuters Connect is paid-only.
+ *   • AP: not added. They also dropped public RSS — apnews.com/hub/<x>/rss
+ *     returns 404, feeds.apnews.com DNS-fails, apnews.com/index.rss is
+ *     401. AP Newsroom is paid-only.
+ *   • Bloomberg: added — they still ship working RSS at
+ *     `feeds.bloomberg.com/<section>/news.rss` for technology, business,
+ *     markets, economics, politics, and green. Fills the wire-agency
+ *     slot Reuters used to occupy.
+ */
 export const LOCKED_SOURCES = [
-  'BBC', 'Reuters', 'TechCrunch', 'The Verge', 'Wired', 'ESPN', 'CNN', 'CNBC',
+  'BBC', 'Bloomberg', 'TechCrunch', 'The Verge', 'Wired', 'ESPN', 'CNN', 'CNBC',
 ] as const
 
+/**
+ * RSS feed URLs per (topic, source). `null` means that source doesn't
+ * cover the topic and we skip it.
+ *
+ * The Verge no longer publishes per-section RSS feeds — every section
+ * URL (`/tech/rss`, `/policy/rss`, `/science/rss`) returns 404. We use
+ * their single all-content feed (`/rss/index.xml`) on every topic;
+ * topical drift is filtered downstream by the LLM relevance pass.
+ *
+ * Wired retired the `/feed/tag/tech/latest/rss` URL but keeps `/feed/rss`
+ * and the `category/<x>/latest/rss` paths working.
+ *
+ * Bloomberg has no Sports/Science feeds (it's a finance-first wire) and
+ * no localized US-news feed; we leave those slots `null`.
+ */
 const RSS_FEEDS_BY_TOPIC: Record<string, Record<string, string | null>> = {
   Tech: {
     BBC: 'https://feeds.bbci.co.uk/news/technology/rss.xml',
-    Reuters: 'https://www.reutersagency.com/feed/?taxonomy=best-topics&post_type=best',
+    Bloomberg: 'https://feeds.bloomberg.com/technology/news.rss',
     TechCrunch: 'https://techcrunch.com/feed/',
-    'The Verge': 'https://www.theverge.com/tech/rss',
-    Wired: 'https://www.wired.com/feed/tag/tech/latest/rss',
+    'The Verge': 'https://www.theverge.com/rss/index.xml',
+    Wired: 'https://www.wired.com/feed/rss',
     ESPN: null,
     CNN: 'http://rss.cnn.com/rss/cnn_tech.rss',
     CNBC: 'https://www.cnbc.com/id/19854910/device/rss/rss.html',
   },
   Business: {
     BBC: 'https://feeds.bbci.co.uk/news/business/rss.xml',
-    Reuters: 'https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best',
+    Bloomberg: 'https://feeds.bloomberg.com/business/news.rss',
     TechCrunch: 'https://techcrunch.com/category/startups/feed/',
-    'The Verge': 'https://www.theverge.com/policy/rss',
+    'The Verge': 'https://www.theverge.com/rss/index.xml',
     Wired: 'https://www.wired.com/feed/category/business/latest/rss',
     ESPN: null,
     CNN: 'http://rss.cnn.com/rss/money_latest.rss',
@@ -87,7 +134,7 @@ const RSS_FEEDS_BY_TOPIC: Record<string, Record<string, string | null>> = {
   },
   Markets: {
     BBC: 'https://feeds.bbci.co.uk/news/business/rss.xml',
-    Reuters: 'https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best',
+    Bloomberg: 'https://feeds.bloomberg.com/markets/news.rss',
     TechCrunch: 'https://techcrunch.com/category/venture/feed/',
     'The Verge': null,
     Wired: null,
@@ -97,9 +144,11 @@ const RSS_FEEDS_BY_TOPIC: Record<string, Record<string, string | null>> = {
   },
   Science: {
     BBC: 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
-    Reuters: 'https://www.reutersagency.com/feed/?best-topics=science&post_type=best',
+    // Bloomberg green is the closest analog to Science (climate,
+    // environment) — keeps Bloomberg in the lineup for this topic.
+    Bloomberg: 'https://feeds.bloomberg.com/green/news.rss',
     TechCrunch: null,
-    'The Verge': 'https://www.theverge.com/science/rss',
+    'The Verge': 'https://www.theverge.com/rss/index.xml',
     Wired: 'https://www.wired.com/feed/category/science/latest/rss',
     ESPN: null,
     CNN: null,
@@ -107,7 +156,7 @@ const RSS_FEEDS_BY_TOPIC: Record<string, Record<string, string | null>> = {
   },
   Sports: {
     BBC: 'https://feeds.bbci.co.uk/sport/rss.xml',
-    Reuters: 'https://www.reutersagency.com/feed/?best-topics=sports&post_type=best',
+    Bloomberg: null,
     TechCrunch: null,
     'The Verge': null,
     Wired: null,
@@ -117,7 +166,9 @@ const RSS_FEEDS_BY_TOPIC: Record<string, Record<string, string | null>> = {
   },
   Local: {
     BBC: 'https://feeds.bbci.co.uk/news/england/rss.xml',
-    Reuters: 'https://www.reutersagency.com/feed/?best-regions=united-states&post_type=best',
+    // Bloomberg politics is US-centric — closest analog to Local for
+    // a finance-first wire that has no city/region feeds.
+    Bloomberg: 'https://feeds.bloomberg.com/politics/news.rss',
     TechCrunch: null,
     'The Verge': null,
     Wired: null,
@@ -312,6 +363,11 @@ export const deduplicateItems = <T extends { id: string }>(items: T[]): T[] => {
   })
 }
 
+/** Max headlines per source in the displayed top-N. Without this, a
+ *  high-frequency publisher (The Verge publishes ~hourly) drowns out
+ *  lower-frequency but more topical sources like BBC Science. */
+const PER_SOURCE_QUOTA = 3
+
 export const selectHeadlines = <T extends { topic: string; source: string; negativity?: string; timestamp: number; title: string }>(
   items: T[],
   topic: string,
@@ -321,15 +377,29 @@ export const selectHeadlines = <T extends { topic: string; source: string; negat
   const sources = sanitizeSources(null)
   filtered = filtered.filter((i) => sources.includes(i.source))
 
-  if (negativityFilter === 'Light') filtered = filtered.filter((i) => i.negativity !== 'high')
-  else if (negativityFilter === 'Strict') filtered = filtered.filter((i) => i.negativity === 'low')
+  if (negativityFilter === 'Less doom') filtered = filtered.filter((i) => i.negativity !== 'high')
+  else if (negativityFilter === 'No doom') filtered = filtered.filter((i) => i.negativity === 'low')
 
   filtered.sort((a, b) => {
     if (a.timestamp !== b.timestamp) return b.timestamp - a.timestamp
     if (a.source !== b.source) return a.source.localeCompare(b.source)
     return a.title.localeCompare(b.title)
   })
-  return filtered
+
+  // Source diversity pass — walk the recency-sorted list, keep at most
+  // PER_SOURCE_QUOTA items per source. Then append leftovers in case
+  // some sources didn't have enough items, so we never drop below
+  // what was available pre-quota.
+  const counts: Record<string, number> = {}
+  const primary: T[] = []
+  const overflow: T[] = []
+  for (const item of filtered) {
+    const n = (counts[item.source] ?? 0) + 1
+    counts[item.source] = n
+    if (n <= PER_SOURCE_QUOTA) primary.push(item)
+    else overflow.push(item)
+  }
+  return [...primary, ...overflow]
 }
 
 export const get24hWindowId = (): string => {
@@ -386,6 +456,7 @@ const extractJson = (text: string): any | null => {
 
 export const processHeadlineItemsWithLLM = async (
   items: RawHeadline[],
+  topic: string,
   signal: AbortSignal,
 ): Promise<EnrichedHeadline[]> => {
   if (items.length === 0) return []
@@ -402,6 +473,9 @@ export const processHeadlineItemsWithLLM = async (
     contextLine: (item.descriptionSnippet || 'Read more for details').substring(0, 120),
     shortSummary: (item.descriptionSnippet || 'Details limited from source preview.').substring(0, 320),
     negativity: 'medium',
+    // Default true on fallback — better to show off-topic items than to
+    // hide everything when the LLM call fails.
+    relevant: true,
   })
 
   const enrichedBatches = await Promise.allSettled(
@@ -416,7 +490,7 @@ export const processHeadlineItemsWithLLM = async (
         )
         .join('\n\n')
 
-      const prompt = `Analyze these ${batch.length} news headlines and provide calm, neutral rewrites.
+      const prompt = `Analyze these ${batch.length} news headlines for the "${topic}" topic and provide calm, neutral rewrites plus a strict topic-relevance judgment.
 
 ${itemsText}
 
@@ -426,12 +500,23 @@ Return ONLY valid JSON:
     {
       "contextLine": "Calm sentence (max 120 chars)",
       "shortSummary": "Brief summary (max 320 chars)",
-      "negativity": "low or medium or high"
+      "negativity": "low or medium or high",
+      "relevant": true or false
     }
   ]
 }
 
-Rules: Never invent facts. Use calm language. If no description, say "Details limited". Return ${batch.length} items in same order.`
+Rules:
+- Never invent facts. Use calm language. If no description, say "Details limited".
+- "relevant": be STRICT. The "${topic}" topic means:
+  - Tech: software, hardware, internet platforms, AI, startups, dev tools.
+  - Business: companies, earnings, deals, strategy, commerce.
+  - Science: research, physics, biology, medicine, climate, space, environment, peer-reviewed findings.
+  - Markets: stocks, bonds, commodities, FX, central banks, trading, IPOs.
+  - Sports: athletes, teams, leagues, games, tournaments.
+  - Local: US national or regional news, civic affairs, courts, policy.
+  Mark relevant=true ONLY if the item is PRIMARILY about ${topic}. Mark false for celebrity/entertainment news, gaming, consumer reviews, legal/political stories that aren't ${topic}, and anything that just tangentially mentions ${topic}.
+- Return ${batch.length} items in same order.`
 
       try {
         const text = await callOpenAI(prompt, 'You are a calm news assistant. Return valid JSON only.', {
@@ -444,11 +529,14 @@ Rules: Never invent facts. Use calm language. If no description, say "Details li
         if (!parsed) return batch.map(fallback)
         return batch.map((item, idx) => {
           const llmData = parsed.items?.[idx] ?? {}
+          // Default relevant=true if the LLM omitted the field (be lenient).
+          const relevant = typeof llmData.relevant === 'boolean' ? llmData.relevant : true
           return {
             ...item,
             contextLine: (llmData.contextLine || item.descriptionSnippet || 'Read more for details').substring(0, 120),
             shortSummary: (llmData.shortSummary || item.descriptionSnippet || 'Details limited from source preview.').substring(0, 320),
             negativity: (llmData.negativity ?? 'medium') as EnrichedHeadline['negativity'],
+            relevant,
           }
         })
       } catch (error: any) {
@@ -463,6 +551,20 @@ Rules: Never invent facts. Use calm language. If no description, say "Details li
     if (r.status === 'fulfilled' && Array.isArray(r.value)) allEnriched.push(...r.value)
   }
   return allEnriched
+}
+
+/**
+ * Drop items the LLM marked as off-topic. Fallback only kicks in if
+ * literally everything got filtered out — we'd rather show 3 truly
+ * on-topic items than dilute with off-topic ones.
+ */
+export const applyRelevanceFilter = (
+  enriched: EnrichedHeadline[],
+  minKeep = 1,
+): EnrichedHeadline[] => {
+  const relevant = enriched.filter((item) => item.relevant)
+  if (relevant.length >= minKeep) return relevant
+  return enriched
 }
 
 export const generateTopicBrief = async (
@@ -487,7 +589,19 @@ export const generateTopicBrief = async (
       .map((item, idx) => `${idx + 1}. [${item.source}] ${item.title}\n   ${item.descriptionSnippet || 'No description'}`)
       .join('\n\n')
 
-    const prompt = `Analyze these ${briefItems.length} ${topic} news items and create a structured brief.
+    const prompt = `Analyze these ${briefItems.length} candidate news items and create a structured brief about "${topic}".
+
+Some items may be off-topic — they came from catch-all feeds. SKIP them.
+
+The "${topic}" topic means:
+- Tech: software, hardware, internet platforms, AI, startups, dev tools.
+- Business: companies, earnings, deals, strategy, commerce.
+- Science: research, physics, biology, medicine, climate, space, environment, peer-reviewed findings.
+- Markets: stocks, bonds, commodities, FX, central banks, trading, IPOs.
+- Sports: athletes, teams, leagues, games, tournaments.
+- Local: US national or regional news, civic affairs, courts, policy.
+
+If an item is celebrity/entertainment, gaming, consumer reviews, or unrelated legal/political stories, EXCLUDE it from every section. Build the brief only from items genuinely about ${topic}. If after excluding off-topic items you have very little content, return shorter sections rather than padding with off-topic items.
 
 ${itemsText}
 
@@ -502,15 +616,15 @@ Return ONLY valid JSON:
   "viewpointsBullets": [{ "text": "bullet text", "sourceIndexes": [2, 4] }]
 }
 
-Section requirements:
-- nowBullets: 5-7 bullets on distinct current developments
-- stakeholdersBullets: 3-6 bullets on key players
-- watchNextBullets: 3-5 bullets on what to watch
-- whyItMattersBullets: 3-5 bullets on implications
-- viewpointsBullets: 2-4 bullets contrasting perspectives
-- sourceIndexes: 0-based indexes (0-${briefItems.length - 1})
+Section requirements (max — go shorter if there isn't enough on-topic content):
+- nowBullets: up to 5-7 bullets on distinct current developments
+- stakeholdersBullets: up to 3-6 bullets on key players
+- watchNextBullets: up to 3-5 bullets on what to watch
+- whyItMattersBullets: up to 3-5 bullets on implications
+- viewpointsBullets: up to 2-4 bullets contrasting perspectives
+- sourceIndexes: 0-based indexes (0-${briefItems.length - 1}) of the ON-TOPIC source items used.
 
-Rules: Use ONLY provided titles. Never invent facts. Keep calm, neutral tone.`
+Rules: Use ONLY provided titles. Never invent facts. Keep calm, neutral tone. SKIP off-topic items.`
 
     const text = await callOpenAI(prompt, 'You are a calm news briefing assistant. Return valid JSON only.', {
       // gpt-4o-mini is 5-10× faster than gpt-4o and good enough for this

@@ -301,7 +301,7 @@ app.all('/api/integrations/:name/:endpoint', async (c) => {
 
 const ALLOWED_RSS_HOSTS = new Set([
   'feeds.bbci.co.uk',
-  'www.reutersagency.com',
+  'feeds.bloomberg.com',
   'techcrunch.com',
   'www.theverge.com',
   'www.wired.com',
@@ -341,9 +341,8 @@ app.get('/api/rss', async (c) => {
       method: 'GET',
       headers: {
         Accept: 'application/rss+xml, application/xml, text/xml',
-        // Several upstream RSS hosts (Reuters, The Verge, Wired) refuse
-        // requests from Cloudflare data-center IPs unless we look like a
-        // real browser. A generic UA is enough to get through.
+        // Some upstreams 403 the default CF outbound UA; a generic
+        // browser UA is enough for everything currently in the allowlist.
         'User-Agent':
           'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
       },
