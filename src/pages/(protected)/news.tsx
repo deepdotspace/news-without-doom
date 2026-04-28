@@ -1,16 +1,23 @@
 /**
  * News Without Doom — calm news brief.
  *
- * Ported from the old widget's HomePage.tsx. Same UX: topic tabs, negativity
- * filter, AI-summarised brief, top headlines, save-for-later drawer, headline
- * detail modal. RSS fetched client-side (with allorigins.win CORS fallback);
- * LLM calls go through `integration.post('openai/chat-completion', …)`.
+ * Pipeline (per topic switch / refresh):
+ *   1. Hydrate from localStorage. If fresh (< 1h), show it instantly and
+ *      skip the network entirely. Otherwise fall through:
+ *   2. Fetch RSS via /api/rss proxy (server-side, edge-cached, no CORS).
+ *   3. As soon as feeds parse, render the headlines list immediately.
+ *   4. Run LLM enrichment + LLM brief generation IN PARALLEL — both
+ *      consume the raw items, neither blocks the other.
+ *   5. Once both complete, persist to localStorage so the next visit
+ *      (and the next reload) is instant.
+ *
+ * Refresh button busts the cached entry for the current topic.
  *
  * Auth-gated by virtue of living under (protected)/. The new SDK requires
  * auth for `integration.post()` to avoid leaking the owner's billing.
  */
 
-import React, { useState, useEffect, useMemo, useRef } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
   TOPICS,
   FILTER_OPTIONS,
@@ -18,7 +25,6 @@ import {
   deduplicateItems,
   selectHeadlines,
   computeHeadlineSetHash,
-  get24hWindowId,
   processHeadlineItemsWithLLM,
   generateTopicBrief,
   generateDetailedSummary,
@@ -27,149 +33,142 @@ import {
   type TopicBrief,
   type SavedHeadline,
 } from '../../lib/news'
+import {
+  loadCache,
+  saveCache,
+  isCacheFresh,
+  formatAge,
+  type TopicCache,
+  type CachedTopic,
+} from '../../lib/storage'
+import NewsHeader from '../../components/NewsHeader'
 
 const EMPTY_BRIEF = (topic: string): TopicBrief => ({
-  themeLabel: topic, takeaway: '', nowBullets: [], stakeholdersBullets: [],
-  watchNextBullets: [], whyItMattersBullets: [], viewpointsBullets: [], bulletArticleMap: {},
+  themeLabel: topic,
+  takeaway: '',
+  nowBullets: [],
+  stakeholdersBullets: [],
+  watchNextBullets: [],
+  whyItMattersBullets: [],
+  viewpointsBullets: [],
+  bulletArticleMap: {},
 })
 
-interface CachedContext {
-  brief: TopicBrief
-  hash: string
-  generatedAt: string
-  windowId: string
-}
-
 export default function NewsPage() {
+  // ─── State ────────────────────────────────────────────────────────────
+  const [cache, setCache] = useState<TopicCache>(() => loadCache())
   const [selectedTopic, setSelectedTopic] = useState<string>('Tech')
   const [negativityFilter, setNegativityFilter] = useState<string>('Light')
-  const [itemsByTopic, setItemsByTopic] = useState<Record<string, EnrichedHeadline[]>>({})
-  const [contextCache, setContextCache] = useState<Record<string, CachedContext>>({})
-  const [itemsCurrent, setItemsCurrent] = useState<EnrichedHeadline[]>([])
-  const [topicBrief, setTopicBrief] = useState<TopicBrief>(EMPTY_BRIEF('Tech'))
-  const [savedItems, setSavedItems] = useState<SavedHeadline[]>([])
+
+  // Live data for the *currently displayed* topic.
+  const [items, setItems] = useState<EnrichedHeadline[]>([])
+  const [brief, setBrief] = useState<TopicBrief>(EMPTY_BRIEF('Tech'))
+  const [fetchedAt, setFetchedAt] = useState<number | null>(null)
+
   const [updating, setUpdating] = useState(false)
-  const [generatingBrief, setGeneratingBrief] = useState(false)
-  const [lastRefresh, setLastRefresh] = useState(new Date().toISOString())
+  const [briefLoading, setBriefLoading] = useState(false)
+  const [forceRefreshNonce, setForceRefreshNonce] = useState(0)
+
+  // Modal / drawer / accordion UI state.
   const [selectedHeadline, setSelectedHeadline] = useState<EnrichedHeadline | null>(null)
+  const [savedItems, setSavedItems] = useState<SavedHeadline[]>([])
   const [savedDrawerOpen, setSavedDrawerOpen] = useState(false)
-  const [headlinesExpanded, setHeadlinesExpanded] = useState(true)
   const [expandedBulletId, setExpandedBulletId] = useState<string | null>(null)
   const [bulletSummaries, setBulletSummaries] = useState<Record<string, string>>({})
   const [loadingSummary, setLoadingSummary] = useState<string | null>(null)
 
-  const abortControllerRef = useRef<AbortController | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
   const requestIdRef = useRef(0)
-  const topicDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const summaryAbortRef = useRef<Record<string, AbortController>>({})
 
-  // ─── Pipeline: fetch → dedupe → sort → enrich → brief ──────────────────
+  // ─── Pipeline ─────────────────────────────────────────────────────────
   useEffect(() => {
-    const runPipeline = async () => {
-      if (abortControllerRef.current) abortControllerRef.current.abort()
-      abortControllerRef.current = new AbortController()
-      const signal = abortControllerRef.current.signal
-      const currentRequestId = ++requestIdRef.current
+    abortRef.current?.abort()
+    abortRef.current = new AbortController()
+    const signal = abortRef.current.signal
+    const requestId = ++requestIdRef.current
 
-      const windowId = get24hWindowId()
-      const cacheKey = `brief:${selectedTopic}:${windowId}`
-      const cachedContext = contextCache[cacheKey]
-      const cachedItems = itemsByTopic[selectedTopic]
-
-      if (cachedContext?.brief) {
-        setTopicBrief(cachedContext.brief)
-        if (cachedItems && cachedItems.length > 0) {
-          const filtered = selectHeadlines(cachedItems, selectedTopic, negativityFilter)
-          setItemsCurrent(filtered.slice(0, 10))
-        }
-      } else {
-        setItemsCurrent([])
-        setTopicBrief({ ...EMPTY_BRIEF(selectedTopic), takeaway: 'Loading...' })
-      }
-
-      setUpdating(true)
-
-      try {
-        const result = await fetchTopicFeeds(selectedTopic, signal)
-        if (currentRequestId !== requestIdRef.current) return
-
-        const items = result.items
-        if (items.length === 0) {
-          setItemsByTopic((prev) => ({ ...prev, [selectedTopic]: [] }))
-          setItemsCurrent([])
-          setTopicBrief({ ...EMPTY_BRIEF(selectedTopic), takeaway: 'No recent headlines found' })
-          setUpdating(false)
-          return
-        }
-
-        const dedup = deduplicateItems(items as RawHeadline[])
-        const sortedAll = [...dedup].sort((a, b) => {
-          if (b.timestamp !== a.timestamp) return b.timestamp - a.timestamp
-          if (a.source !== b.source) return a.source.localeCompare(b.source)
-          return a.title.localeCompare(b.title)
-        })
-
-        const filtered = selectHeadlines(sortedAll as any, selectedTopic, negativityFilter) as RawHeadline[]
-        const displayedItems = filtered.slice(0, 10)
-
-        const enrichedDisplayed = await processHeadlineItemsWithLLM(displayedItems, signal)
-        if (currentRequestId !== requestIdRef.current) return
-
-        const currentHash = computeHeadlineSetHash(enrichedDisplayed)
-        const needsRegeneration = !cachedContext || cachedContext.hash !== currentHash
-
-        let brief: TopicBrief
-        if (needsRegeneration) {
-          setGeneratingBrief(true)
-          brief = await generateTopicBrief(enrichedDisplayed, selectedTopic, signal)
-          if (currentRequestId !== requestIdRef.current) return
-          setContextCache((prev) => ({
-            ...prev,
-            [cacheKey]: { brief, hash: currentHash, generatedAt: new Date().toISOString(), windowId },
-          }))
-        } else {
-          brief = cachedContext.brief
-        }
-
-        const enrichedMap = new Map(enrichedDisplayed.map((item) => [item.id, item]))
-        const finalAll: EnrichedHeadline[] = sortedAll.map(
-          (item) => enrichedMap.get(item.id) ?? ({ ...item, contextLine: '', shortSummary: '', negativity: 'medium' } as EnrichedHeadline),
-        )
-
-        if (currentRequestId === requestIdRef.current) {
-          setItemsByTopic((prev) => ({ ...prev, [selectedTopic]: finalAll }))
-          setItemsCurrent(enrichedDisplayed)
-          setTopicBrief(brief)
-        }
-      } catch (error: any) {
-        if (error?.name === 'AbortError') return
-        console.error('Fetch error:', error)
-        if (currentRequestId === requestIdRef.current) setItemsCurrent([])
-      } finally {
-        if (currentRequestId === requestIdRef.current) {
-          setUpdating(false)
-          setGeneratingBrief(false)
-        }
-      }
+    // 1. Cache hit — render instantly, skip the network.
+    const cached = cache[selectedTopic]
+    if (forceRefreshNonce === 0 && isCacheFresh(cached)) {
+      const filtered = selectHeadlines(cached.items, selectedTopic, negativityFilter).slice(0, 10)
+      setItems(filtered)
+      setBrief(cached.brief)
+      setFetchedAt(cached.fetchedAt)
+      setUpdating(false)
+      setBriefLoading(false)
+      return
     }
 
-    runPipeline()
-    return () => { abortControllerRef.current?.abort() }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTopic, lastRefresh, negativityFilter])
+    // 2. Cache miss / refresh — show skeletons while we fetch.
+    setItems([])
+    setBrief(EMPTY_BRIEF(selectedTopic))
+    setFetchedAt(null)
+    setUpdating(true)
+    setBriefLoading(true)
 
-  // Reset bullet expand state on topic change.
+    runPipeline({
+      topic: selectedTopic,
+      filter: negativityFilter,
+      signal,
+      isCurrent: () => requestId === requestIdRef.current,
+      onItemsReady: (raw) => {
+        if (requestId !== requestIdRef.current) return
+        // 3. As soon as RSS is parsed, render the headlines (without
+        // enriched calm rewrites yet — those land later).
+        const ranked = selectHeadlines(raw as any, selectedTopic, negativityFilter).slice(0, 10) as EnrichedHeadline[]
+        setItems(ranked)
+        setUpdating(false)
+      },
+      onEnriched: (enriched) => {
+        if (requestId !== requestIdRef.current) return
+        setItems(enriched)
+      },
+      onBrief: (newBrief) => {
+        if (requestId !== requestIdRef.current) return
+        setBrief(newBrief)
+        setBriefLoading(false)
+      },
+      onComplete: (cached) => {
+        if (requestId !== requestIdRef.current) return
+        setCache((prev) => {
+          const next = { ...prev, [selectedTopic]: cached }
+          saveCache(next)
+          return next
+        })
+        setFetchedAt(cached.fetchedAt)
+      },
+      onError: () => {
+        if (requestId !== requestIdRef.current) return
+        setUpdating(false)
+        setBriefLoading(false)
+      },
+    })
+
+    return () => abortRef.current?.abort()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTopic, negativityFilter, forceRefreshNonce])
+
+  // Reset bullet expand state when topic changes.
   useEffect(() => {
     setExpandedBulletId(null)
     Object.values(summaryAbortRef.current).forEach((c) => c.abort())
     summaryAbortRef.current = {}
   }, [selectedTopic])
 
-  const headlines = useMemo(() => (itemsCurrent ?? []).slice(0, 10), [itemsCurrent])
-  const sortedSavedItems = useMemo(
-    () => [...savedItems].sort((a, b) => (b.savedAt ?? 0) - (a.savedAt ?? 0)),
-    [savedItems],
-  )
+  // ─── Handlers ─────────────────────────────────────────────────────────
+  const handleRefresh = () => {
+    // Drop the cached entry for the current topic, then bump the nonce
+    // to force the pipeline to actually re-run (instead of the cache hit
+    // path).
+    setCache((prev) => {
+      const next = { ...prev }
+      delete next[selectedTopic]
+      saveCache(next)
+      return next
+    })
+    setForceRefreshNonce((n) => n + 1)
+  }
 
   const handleSave = (headline: EnrichedHeadline) => {
     setSavedItems((prev) => {
@@ -178,30 +177,7 @@ export default function NewsPage() {
       return [...prev, { ...headline, savedAt: Date.now() }]
     })
   }
-
-  const isSaved = (headlineId: string) => savedItems.some((h) => h.id === headlineId)
-
-  const fetchBulletSummary = async (articles: EnrichedHeadline[], bulletId: string) => {
-    const cacheKey = articles.map((a) => a.link).sort().join('::')
-    if (bulletSummaries[cacheKey]) return bulletSummaries[cacheKey]
-
-    summaryAbortRef.current[bulletId]?.abort()
-    const controller = new AbortController()
-    summaryAbortRef.current[bulletId] = controller
-
-    try {
-      setLoadingSummary(bulletId)
-      const summary = await generateDetailedSummary(articles, controller.signal)
-      setBulletSummaries((prev) => ({ ...prev, [cacheKey]: summary }))
-      return summary
-    } catch (error: any) {
-      if (error?.name === 'AbortError') return null
-      return 'Unable to generate summary at this time.'
-    } finally {
-      setLoadingSummary(null)
-      delete summaryAbortRef.current[bulletId]
-    }
-  }
+  const isSaved = (id: string) => savedItems.some((h) => h.id === id)
 
   const handleReadMoreToggle = async (
     bulletId: string,
@@ -214,305 +190,301 @@ export default function NewsPage() {
     }
     setExpandedBulletId(bulletId)
     const cacheKey = articles.map((a) => a.link).sort().join('::')
-    if (!bulletSummaries[cacheKey]) await fetchBulletSummary(articles, bulletId)
+    if (!bulletSummaries[cacheKey]) {
+      summaryAbortRef.current[bulletId]?.abort()
+      const controller = new AbortController()
+      summaryAbortRef.current[bulletId] = controller
+      try {
+        setLoadingSummary(bulletId)
+        const summary = await generateDetailedSummary(articles, controller.signal)
+        setBulletSummaries((prev) => ({ ...prev, [cacheKey]: summary }))
+      } catch (err: any) {
+        if (err?.name !== 'AbortError') {
+          setBulletSummaries((prev) => ({ ...prev, [cacheKey]: 'Unable to generate summary.' }))
+        }
+      } finally {
+        setLoadingSummary(null)
+        delete summaryAbortRef.current[bulletId]
+      }
+    }
     setTimeout(() => {
       const element = (event?.target as HTMLElement)?.closest('li')
-      if (element) element.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+      element?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     }, 150)
   }
 
-  const selectTopic = (topic: string) => {
-    if (topicDebounceRef.current) clearTimeout(topicDebounceRef.current)
-    setSelectedTopic(topic)
-    topicDebounceRef.current = setTimeout(() => {
-      setLastRefresh(new Date().toISOString())
-    }, 300)
-  }
+  // ─── Derived ──────────────────────────────────────────────────────────
+  const sortedSavedItems = useMemo(
+    () => [...savedItems].sort((a, b) => (b.savedAt ?? 0) - (a.savedAt ?? 0)),
+    [savedItems],
+  )
+  const headlines = useMemo(() => items.slice(0, 10), [items])
 
-  const handleRefresh = () => setLastRefresh(new Date().toISOString())
+  const ageLabel = useMemo(() => {
+    if (!fetchedAt) return null
+    return formatAge(Date.now() - fetchedAt)
+  }, [fetchedAt, items])
 
-  const brief = topicBrief.themeLabel ? topicBrief : EMPTY_BRIEF(selectedTopic)
+  const today = useMemo(() => {
+    return new Date().toLocaleDateString('en-US', {
+      weekday: 'long',
+      month: 'long',
+      day: 'numeric',
+    })
+  }, [])
 
+  // ─── Render ───────────────────────────────────────────────────────────
   return (
-    <div className="w-full h-full overflow-y-auto bg-background">
-      {/* Sticky toolbar */}
-      <div className="sticky top-0 z-30 bg-background/95 backdrop-blur-sm border-b border-border px-4 py-2">
-        <div className="max-w-3xl mx-auto flex items-center gap-2">
-          <span className="text-xs font-bold text-foreground whitespace-nowrap shrink-0">News Without Doom</span>
-          <div className="w-px h-3.5 bg-border shrink-0"></div>
-          {TOPICS.map((topic) => (
-            <button
-              key={topic}
-              onClick={() => selectTopic(topic)}
-              className={`px-2 py-0.5 rounded text-xs font-medium transition-all shrink-0 ${
-                selectedTopic === topic
-                  ? 'bg-primary text-primary-foreground'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              {topic}
-            </button>
-          ))}
-          <div className="flex-1"></div>
-          {FILTER_OPTIONS.map((option) => (
-            <button
-              key={option}
-              onClick={() => setNegativityFilter(option)}
-              className={`px-2 py-0.5 rounded text-xs font-medium transition-all shrink-0 ${
-                negativityFilter === option
-                  ? 'bg-foreground text-background'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              {option}
-            </button>
-          ))}
-          <div className="w-px h-3.5 bg-border shrink-0"></div>
-          {updating && <div className="w-3 h-3 border-2 border-primary border-t-transparent rounded-full animate-spin shrink-0"></div>}
-          <button onClick={handleRefresh} className="text-xs text-primary hover:text-primary/80 font-medium shrink-0">Refresh</button>
-          <button
-            onClick={() => setSavedDrawerOpen(!savedDrawerOpen)}
-            className="text-xs text-muted-foreground hover:text-foreground font-medium shrink-0"
-          >
-            Saved{savedItems.length > 0 && ` (${savedItems.length})`}
-          </button>
-        </div>
-      </div>
+    <div className="flex h-full flex-col bg-background">
+      <NewsHeader
+        topics={TOPICS}
+        selectedTopic={selectedTopic}
+        onSelectTopic={setSelectedTopic}
+        filterOptions={FILTER_OPTIONS}
+        negativityFilter={negativityFilter}
+        onChangeFilter={setNegativityFilter}
+        updating={updating || briefLoading}
+        onRefresh={handleRefresh}
+        savedCount={savedItems.length}
+        onToggleSaved={() => setSavedDrawerOpen((v) => !v)}
+      />
 
-      {/* Content */}
-      <div className="max-w-3xl mx-auto px-4 py-4">
-        {/* Brief */}
-        {!brief.themeLabel || brief.nowBullets?.length === 0 ? (
-          <div className="py-16 text-center">
-            <div className="w-6 h-6 border-2 border-primary/40 border-t-primary rounded-full animate-spin mx-auto mb-3"></div>
-            <p className="text-sm text-muted-foreground">Loading {selectedTopic} brief...</p>
-            {generatingBrief && (
-              <p className="text-xs text-muted-foreground/60 mt-1">Analyzing headlines from trusted sources</p>
+      <div className="flex-1 overflow-y-auto">
+        <main className="mx-auto w-full max-w-3xl px-5 pt-10 pb-24 sm:px-8">
+          {/* Date strap */}
+          <div className="mb-3 flex items-center gap-2 text-[10.5px] font-medium uppercase tracking-[0.18em] text-muted-foreground">
+            <span>{today.toUpperCase()}</span>
+            {ageLabel && (
+              <>
+                <span className="h-[3px] w-[3px] rounded-full bg-muted-foreground/40" />
+                <span className="normal-case tracking-normal text-[11px] font-normal">Updated {ageLabel}</span>
+              </>
             )}
           </div>
-        ) : (
-          <div className="space-y-3">
-            {/* Hero takeaway */}
-            {brief.takeaway && (
-              <div className="bg-card rounded-lg border border-border p-4 shadow-card">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="text-xs font-bold uppercase tracking-wider text-primary">
-                    {brief.themeLabel || selectedTopic}
-                  </span>
-                  {generatingBrief && (
-                    <div className="w-2.5 h-2.5 border-2 border-primary/40 border-t-transparent rounded-full animate-spin"></div>
-                  )}
-                </div>
-                <p className="text-sm text-foreground leading-relaxed font-medium">{brief.takeaway}</p>
-              </div>
+
+          {/* Hero takeaway */}
+          <Hero
+            topic={selectedTopic}
+            brief={brief}
+            loading={briefLoading}
+          />
+
+          {/* Brief grid */}
+          <section className="mt-10 grid grid-cols-1 gap-5 sm:grid-cols-2">
+            {briefLoading && brief.nowBullets.length === 0 ? (
+              <>
+                <SkeletonCard />
+                <SkeletonCard />
+                <SkeletonCard />
+                <SkeletonCard />
+              </>
+            ) : (
+              <>
+                <BriefSection
+                  index="01"
+                  title="What's happening"
+                  bullets={brief.nowBullets}
+                  bulletArticleMap={brief.bulletArticleMap}
+                  expandedBulletId={expandedBulletId}
+                  loadingSummary={loadingSummary}
+                  bulletSummaries={bulletSummaries}
+                  onReadMoreToggle={handleReadMoreToggle}
+                  span="full"
+                />
+                <BriefSection
+                  index="02"
+                  title="Key players"
+                  bullets={brief.stakeholdersBullets}
+                  bulletArticleMap={brief.bulletArticleMap}
+                  expandedBulletId={expandedBulletId}
+                  loadingSummary={loadingSummary}
+                  bulletSummaries={bulletSummaries}
+                  onReadMoreToggle={handleReadMoreToggle}
+                />
+                <BriefSection
+                  index="03"
+                  title="What to watch"
+                  bullets={brief.watchNextBullets}
+                  bulletArticleMap={brief.bulletArticleMap}
+                  expandedBulletId={expandedBulletId}
+                  loadingSummary={loadingSummary}
+                  bulletSummaries={bulletSummaries}
+                  onReadMoreToggle={handleReadMoreToggle}
+                />
+                <BriefSection
+                  index="04"
+                  title="Why it matters"
+                  bullets={brief.whyItMattersBullets}
+                  bulletArticleMap={brief.bulletArticleMap}
+                  expandedBulletId={expandedBulletId}
+                  loadingSummary={loadingSummary}
+                  bulletSummaries={bulletSummaries}
+                  onReadMoreToggle={handleReadMoreToggle}
+                />
+                <BriefSection
+                  index="05"
+                  title="Viewpoints"
+                  bullets={brief.viewpointsBullets}
+                  bulletArticleMap={brief.bulletArticleMap}
+                  expandedBulletId={expandedBulletId}
+                  loadingSummary={loadingSummary}
+                  bulletSummaries={bulletSummaries}
+                  onReadMoreToggle={handleReadMoreToggle}
+                />
+              </>
             )}
+          </section>
 
-            <BriefSection
-              title="What's Happening Now"
-              bullets={brief.nowBullets}
-              bulletArticleMap={brief.bulletArticleMap}
-              expandedBulletId={expandedBulletId}
-              loadingSummary={loadingSummary}
-              bulletSummaries={bulletSummaries}
-              onReadMoreToggle={handleReadMoreToggle}
-            />
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <BriefSection
-                title="Key Players"
-                bullets={brief.stakeholdersBullets}
-                bulletArticleMap={brief.bulletArticleMap}
-                expandedBulletId={expandedBulletId}
-                loadingSummary={loadingSummary}
-                bulletSummaries={bulletSummaries}
-                onReadMoreToggle={handleReadMoreToggle}
-              />
-              <BriefSection
-                title="What to Watch"
-                bullets={brief.watchNextBullets}
-                bulletArticleMap={brief.bulletArticleMap}
-                expandedBulletId={expandedBulletId}
-                loadingSummary={loadingSummary}
-                bulletSummaries={bulletSummaries}
-                onReadMoreToggle={handleReadMoreToggle}
-              />
-              <BriefSection
-                title="Why It Matters"
-                bullets={brief.whyItMattersBullets}
-                bulletArticleMap={brief.bulletArticleMap}
-                expandedBulletId={expandedBulletId}
-                loadingSummary={loadingSummary}
-                bulletSummaries={bulletSummaries}
-                onReadMoreToggle={handleReadMoreToggle}
-              />
-              <BriefSection
-                title="Viewpoints"
-                bullets={brief.viewpointsBullets}
-                bulletArticleMap={brief.bulletArticleMap}
-                expandedBulletId={expandedBulletId}
-                loadingSummary={loadingSummary}
-                bulletSummaries={bulletSummaries}
-                onReadMoreToggle={handleReadMoreToggle}
-              />
-            </div>
-          </div>
-        )}
-
-        {/* Top Headlines */}
-        {headlines.length > 0 && (
-          <div className="mt-5">
-            <button
-              onClick={() => setHeadlinesExpanded(!headlinesExpanded)}
-              className="flex items-center gap-2 mb-3 text-left"
-            >
-              <h3 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Top Headlines</h3>
-              <svg
-                className={`w-3 h-3 text-muted-foreground transition-transform ${headlinesExpanded ? 'rotate-180' : ''}`}
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
-              </svg>
-            </button>
-
-            {headlinesExpanded && (
-              <div className="bg-card rounded-lg border border-border shadow-card divide-y divide-border/50">
-                {headlines.slice(0, 5).map((headline) => (
-                  <div
+          {/* Top headlines */}
+          <section className="mt-12">
+            <h3 className="mb-4 text-[10.5px] font-medium uppercase tracking-[0.18em] text-muted-foreground">
+              Top headlines
+            </h3>
+            {headlines.length === 0 ? (
+              <SkeletonHeadlines />
+            ) : (
+              <ul className="divide-y divide-border/60 border-y border-border/60">
+                {headlines.map((headline) => (
+                  <li
                     key={headline.id}
-                    className="px-4 py-3 cursor-pointer group hover:bg-muted/30 transition-colors first:rounded-t-lg last:rounded-b-lg"
                     onClick={() => setSelectedHeadline(headline)}
+                    className="group cursor-pointer py-4 transition-colors hover:bg-secondary/30"
                   >
-                    <div className="flex items-baseline gap-2 mb-0.5">
-                      <span className="text-xs font-bold uppercase tracking-wide text-muted-foreground shrink-0">
-                        {headline.source}
-                      </span>
-                      <span className="text-xs text-muted-foreground/60">{headline.publishedAt}</span>
+                    <div className="mb-1 flex items-center gap-2 text-[10.5px] uppercase tracking-[0.14em]">
+                      <span className="font-semibold text-primary">{headline.source}</span>
+                      <span className="h-[3px] w-[3px] rounded-full bg-muted-foreground/40" />
+                      <span className="text-muted-foreground">{headline.publishedAt}</span>
                     </div>
-                    <p className="text-[13px] text-foreground leading-snug group-hover:text-primary transition-colors">
+                    <p className="font-serif text-[16px] leading-snug text-foreground transition-colors group-hover:text-primary">
                       {headline.title}
                     </p>
                     {headline.contextLine && (
-                      <p className="text-xs text-muted-foreground mt-0.5 line-clamp-1">{headline.contextLine}</p>
+                      <p className="mt-1 line-clamp-2 text-[13px] leading-relaxed text-muted-foreground">
+                        {headline.contextLine}
+                      </p>
                     )}
-                  </div>
+                  </li>
                 ))}
-              </div>
+              </ul>
             )}
-          </div>
-        )}
+          </section>
+        </main>
       </div>
 
-      {/* Saved Drawer */}
       {savedDrawerOpen && (
-        <div className="fixed inset-0 bg-foreground/20 z-50 backdrop-blur-sm" onClick={() => setSavedDrawerOpen(false)}>
-          <div
-            className="fixed bottom-0 left-0 right-0 bg-card rounded-t-xl max-h-[60vh] overflow-y-auto shadow-2xl border-t border-border"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="max-w-3xl mx-auto p-4">
-              <div className="flex items-center justify-between mb-3">
-                <h2 className="text-sm font-bold text-foreground">Saved for Later</h2>
-                <button
-                  onClick={() => setSavedDrawerOpen(false)}
-                  className="text-xs text-muted-foreground hover:text-foreground"
-                >
-                  Close
-                </button>
-              </div>
-              {sortedSavedItems.length === 0 ? (
-                <p className="text-xs text-muted-foreground text-center py-6">No saved articles yet</p>
-              ) : (
-                <div className="space-y-1">
-                  {sortedSavedItems.map((item) => (
-                    <div
-                      key={item.id}
-                      className="flex items-start justify-between gap-2 py-2 border-b border-border/50 last:border-0"
-                    >
-                      <div className="flex-1 cursor-pointer min-w-0" onClick={() => setSelectedHeadline(item)}>
-                        <span className="text-xs font-bold uppercase text-muted-foreground mr-2">{item.source}</span>
-                        <span className="text-[13px] text-foreground">{item.title}</span>
-                      </div>
-                      <button
-                        onClick={() => handleSave(item)}
-                        className="text-xs text-muted-foreground hover:text-destructive shrink-0"
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+        <SavedDrawer
+          items={sortedSavedItems}
+          onClose={() => setSavedDrawerOpen(false)}
+          onOpenItem={(item) => setSelectedHeadline(item)}
+          onRemove={handleSave}
+        />
       )}
-
-      {/* Headline Modal */}
       {selectedHeadline && (
-        <div
-          className="fixed inset-0 bg-foreground/20 flex items-center justify-center z-50 p-4 backdrop-blur-sm"
-          onClick={() => setSelectedHeadline(null)}
-        >
-          <div
-            className="bg-card rounded-lg shadow-2xl w-full max-w-lg max-h-[75vh] overflow-y-auto border border-border"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="p-5">
-              <div className="flex items-start justify-between mb-3">
-                <div className="flex-1">
-                  <div className="flex items-center gap-2 mb-1.5">
-                    <span className="text-xs font-bold uppercase text-muted-foreground">{selectedHeadline.source}</span>
-                    <span className="text-xs text-muted-foreground/60">{selectedHeadline.publishedAt}</span>
-                  </div>
-                  <h2 className="text-base font-bold text-foreground leading-snug">{selectedHeadline.title}</h2>
-                </div>
-                <button
-                  onClick={() => setSelectedHeadline(null)}
-                  className="text-xs text-muted-foreground hover:text-foreground ml-3 shrink-0 mt-1"
-                >
-                  Close
-                </button>
-              </div>
-
-              {selectedHeadline.contextLine && (
-                <p className="text-[13px] text-foreground border-l-2 border-primary pl-3 mb-3 leading-relaxed">
-                  {selectedHeadline.contextLine}
-                </p>
-              )}
-
-              {selectedHeadline.shortSummary && (
-                <p className="text-xs text-muted-foreground leading-relaxed mb-4">{selectedHeadline.shortSummary}</p>
-              )}
-
-              <div className="flex items-center justify-between pt-3 border-t border-border">
-                <button
-                  onClick={() => handleSave(selectedHeadline)}
-                  className="text-xs text-muted-foreground hover:text-foreground font-medium"
-                >
-                  {isSaved(selectedHeadline.id) ? 'Saved' : 'Save for Later'}
-                </button>
-                <a
-                  href={selectedHeadline.link}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="px-3 py-1.5 bg-primary hover:bg-primary/90 text-primary-foreground rounded text-xs font-semibold transition-colors"
-                >
-                  Read Full Article
-                </a>
-              </div>
-            </div>
-          </div>
-        </div>
+        <HeadlineModal
+          headline={selectedHeadline}
+          isSaved={isSaved(selectedHeadline.id)}
+          onClose={() => setSelectedHeadline(null)}
+          onToggleSave={() => handleSave(selectedHeadline)}
+        />
       )}
     </div>
   )
 }
 
-// ─── Brief section ───────────────────────────────────────────────────────
+// ─── Pipeline ────────────────────────────────────────────────────────────
+
+interface PipelineDeps {
+  topic: string
+  filter: string
+  signal: AbortSignal
+  isCurrent: () => boolean
+  onItemsReady: (items: RawHeadline[]) => void
+  onEnriched: (items: EnrichedHeadline[]) => void
+  onBrief: (brief: TopicBrief) => void
+  onComplete: (cached: CachedTopic) => void
+  onError: () => void
+}
+
+async function runPipeline(deps: PipelineDeps) {
+  const { topic, filter, signal, isCurrent, onItemsReady, onEnriched, onBrief, onComplete, onError } = deps
+  try {
+    const { items: raw } = await fetchTopicFeeds(topic, signal)
+    if (!isCurrent()) return
+    if (raw.length === 0) {
+      onBrief({
+        themeLabel: topic,
+        takeaway: 'No recent headlines found.',
+        nowBullets: [],
+        stakeholdersBullets: [],
+        watchNextBullets: [],
+        whyItMattersBullets: [],
+        viewpointsBullets: [],
+        bulletArticleMap: {},
+      })
+      onError()
+      return
+    }
+
+    const dedup = deduplicateItems(raw)
+    const sorted = [...dedup].sort((a, b) => {
+      if (b.timestamp !== a.timestamp) return b.timestamp - a.timestamp
+      if (a.source !== b.source) return a.source.localeCompare(b.source)
+      return a.title.localeCompare(b.title)
+    })
+    onItemsReady(sorted)
+
+    // Top 10 (post-filter) feed both LLM passes.
+    const filtered = selectHeadlines(sorted as any, topic, filter).slice(0, 10) as RawHeadline[]
+
+    // Run enrichment + brief generation in parallel — both consume raw
+    // descriptions, neither needs the other's output.
+    const [enriched, brief] = await Promise.all([
+      processHeadlineItemsWithLLM(filtered, signal),
+      generateTopicBrief(filtered as unknown as EnrichedHeadline[], topic, signal),
+    ])
+    if (!isCurrent()) return
+
+    onEnriched(enriched)
+    onBrief(brief)
+
+    onComplete({
+      brief,
+      items: enriched,
+      fetchedAt: Date.now(),
+    })
+  } catch (err: any) {
+    if (err?.name === 'AbortError') return
+    console.error('[news-pipeline] failed:', err)
+    onError()
+  }
+}
+
+// ─── Hero takeaway ───────────────────────────────────────────────────────
+
+function Hero({ topic, brief, loading }: { topic: string; brief: TopicBrief; loading: boolean }) {
+  return (
+    <div>
+      <div className="mb-2 text-[10.5px] font-medium uppercase tracking-[0.22em] text-primary">
+        {brief.themeLabel || topic}
+      </div>
+      {loading && !brief.takeaway ? (
+        <div className="space-y-2">
+          <div className="h-7 w-11/12 animate-pulse rounded bg-muted/60" />
+          <div className="h-7 w-9/12 animate-pulse rounded bg-muted/60" />
+        </div>
+      ) : (
+        <h1 className="font-serif text-[28px] leading-tight text-foreground sm:text-[34px]">
+          {brief.takeaway || `A calm read on ${topic.toLowerCase()}.`}
+        </h1>
+      )}
+    </div>
+  )
+}
+
+// ─── Brief section card ──────────────────────────────────────────────────
 
 interface BriefSectionProps {
+  index: string
   title: string
   bullets: { id: string; text: string }[]
   bulletArticleMap: Record<string, EnrichedHeadline[]>
@@ -520,9 +492,11 @@ interface BriefSectionProps {
   loadingSummary: string | null
   bulletSummaries: Record<string, string>
   onReadMoreToggle: (bulletId: string, articles: EnrichedHeadline[], event: React.MouseEvent) => void
+  span?: 'half' | 'full'
 }
 
 function BriefSection({
+  index,
   title,
   bullets,
   bulletArticleMap,
@@ -530,12 +504,20 @@ function BriefSection({
   loadingSummary,
   bulletSummaries,
   onReadMoreToggle,
+  span = 'half',
 }: BriefSectionProps) {
   if (!bullets || bullets.length === 0) return null
   return (
-    <div className="bg-card rounded-lg border border-border p-4 shadow-card">
-      <h4 className="text-xs font-bold uppercase tracking-wider text-primary mb-3">{title}</h4>
-      <ul className="space-y-2.5">
+    <article
+      className={`rounded-2xl border border-border/60 bg-card p-5 sm:p-6 ${
+        span === 'full' ? 'sm:col-span-2' : ''
+      }`}
+    >
+      <header className="mb-4 flex items-baseline gap-3">
+        <span className="text-[10.5px] font-medium tabular-nums text-muted-foreground/70">{index}</span>
+        <h4 className="text-[10.5px] font-medium uppercase tracking-[0.18em] text-foreground">{title}</h4>
+      </header>
+      <ul className="space-y-3">
         {bullets.map((bullet) => {
           const articles = bulletArticleMap?.[bullet.id]
           const isExpanded = expandedBulletId === bullet.id
@@ -543,53 +525,47 @@ function BriefSection({
           const cachedSummary = cacheKey ? bulletSummaries[cacheKey] : null
 
           return (
-            <li key={bullet.id || bullet.text}>
+            <li key={bullet.id || bullet.text} className="text-[14px] leading-relaxed">
               <div className="flex items-start gap-2.5">
-                <div className="w-1.5 h-1.5 bg-primary/50 rounded-full mt-[6px] flex-shrink-0"></div>
+                <span className="mt-[7px] h-1 w-1 shrink-0 rounded-full bg-primary/60" />
                 <div className="flex-1 min-w-0">
-                  <span className="text-[13px] leading-relaxed text-foreground">{bullet.text}</span>
+                  <span className="text-foreground">{bullet.text}</span>
                   {articles && articles.length > 0 && (
-                    <>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px]">
                       {articles.map((article) => (
                         <a
                           key={article.id}
                           href={article.link}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="inline-flex items-center ml-1.5 text-primary/60 hover:text-primary transition-colors"
                           title={article.title}
+                          className="rounded-full border border-border bg-secondary/60 px-2 py-0.5 font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/10 hover:text-primary"
                         >
-                          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                            <path
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"
-                            />
-                          </svg>
+                          {article.source}
                         </a>
                       ))}
                       <button
                         onClick={(e) => onReadMoreToggle(bullet.id, articles, e)}
-                        className="inline-flex ml-1.5 text-xs text-muted-foreground hover:text-primary transition-colors"
+                        className="rounded-full px-1.5 py-0.5 font-medium text-muted-foreground transition-colors hover:text-foreground"
                       >
-                        {isExpanded ? '(less)' : '(more)'}
+                        {isExpanded ? 'Hide' : 'Read more'}
                       </button>
-                    </>
+                    </div>
                   )}
                 </div>
               </div>
 
               {isExpanded && articles && articles.length > 0 && (
-                <div className="accordion-panel ml-4 mt-2 mb-1 pl-3 border-l-2 border-primary/20">
+                <div className="accordion-panel ml-3.5 mt-3 border-l-2 border-primary/30 pl-3">
                   {loadingSummary === bullet.id ? (
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground py-1">
-                      <div className="w-3 h-3 border-2 border-primary/30 border-t-transparent rounded-full animate-spin"></div>
-                      <span>Generating summary...</span>
+                    <div className="flex items-center gap-2 py-1 text-[12px] text-muted-foreground">
+                      <span className="h-3 w-3 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
+                      Generating summary…
                     </div>
                   ) : cachedSummary ? (
-                    <p className="text-xs text-muted-foreground leading-relaxed">{cachedSummary}</p>
+                    <p className="text-[12.5px] leading-relaxed text-muted-foreground">{cachedSummary}</p>
                   ) : (
-                    <p className="text-xs text-muted-foreground italic">Unable to load summary</p>
+                    <p className="text-[12.5px] italic text-muted-foreground">Unable to load summary.</p>
                   )}
                 </div>
               )}
@@ -597,6 +573,183 @@ function BriefSection({
           )
         })}
       </ul>
+    </article>
+  )
+}
+
+// ─── Skeletons ──────────────────────────────────────────────────────────
+
+function SkeletonCard() {
+  return (
+    <div className="rounded-2xl border border-border/60 bg-card p-5 sm:p-6 first:sm:col-span-2">
+      <div className="mb-4 h-3 w-28 animate-pulse rounded bg-muted/60" />
+      <div className="space-y-2.5">
+        {[0, 1, 2, 3].map((i) => (
+          <div key={i} className="flex items-start gap-2.5">
+            <span className="mt-[7px] h-1 w-1 rounded-full bg-muted-foreground/30" />
+            <div
+              className="h-3.5 animate-pulse rounded bg-muted/60"
+              style={{ width: `${85 - i * 8}%` }}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function SkeletonHeadlines() {
+  return (
+    <ul className="divide-y divide-border/60 border-y border-border/60">
+      {[0, 1, 2, 3, 4].map((i) => (
+        <li key={i} className="py-4">
+          <div className="mb-2 h-2.5 w-24 animate-pulse rounded bg-muted/60" />
+          <div className="h-4 w-11/12 animate-pulse rounded bg-muted/60" style={{ width: `${90 - i * 6}%` }} />
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+// ─── Saved drawer ───────────────────────────────────────────────────────
+
+function SavedDrawer({
+  items,
+  onClose,
+  onOpenItem,
+  onRemove,
+}: {
+  items: SavedHeadline[]
+  onClose: () => void
+  onOpenItem: (item: SavedHeadline) => void
+  onRemove: (item: SavedHeadline) => void
+}) {
+  return (
+    <div className="fixed inset-0 z-50 bg-foreground/30 backdrop-blur-sm" onClick={onClose}>
+      <div
+        className="absolute bottom-0 left-0 right-0 max-h-[70vh] overflow-y-auto rounded-t-2xl border-t border-border bg-card shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mx-auto max-w-3xl px-5 py-5 sm:px-8">
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <h2 className="font-serif text-[20px] font-semibold text-foreground">Saved for later</h2>
+              <p className="mt-0.5 text-[12px] text-muted-foreground">
+                {items.length} {items.length === 1 ? 'article' : 'articles'} · ephemeral, cleared on reload
+              </p>
+            </div>
+            <button
+              onClick={onClose}
+              className="rounded-full px-3 py-1 text-[12px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              Close
+            </button>
+          </div>
+
+          {items.length === 0 ? (
+            <div className="py-10 text-center text-[13px] text-muted-foreground">
+              Nothing saved yet. Open any headline and tap Save for later.
+            </div>
+          ) : (
+            <ul className="divide-y divide-border/60">
+              {items.map((item) => (
+                <li key={item.id} className="flex items-start justify-between gap-4 py-3">
+                  <button
+                    onClick={() => onOpenItem(item)}
+                    className="flex-1 min-w-0 text-left"
+                  >
+                    <div className="mb-0.5 text-[10.5px] uppercase tracking-[0.14em] text-primary">
+                      {item.source}
+                    </div>
+                    <div className="font-serif text-[14px] leading-snug text-foreground">{item.title}</div>
+                  </button>
+                  <button
+                    onClick={() => onRemove(item)}
+                    className="shrink-0 text-[11.5px] text-muted-foreground transition-colors hover:text-destructive"
+                  >
+                    Remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Headline modal ─────────────────────────────────────────────────────
+
+function HeadlineModal({
+  headline,
+  isSaved,
+  onClose,
+  onToggleSave,
+}: {
+  headline: EnrichedHeadline
+  isSaved: boolean
+  onClose: () => void
+  onToggleSave: () => void
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/30 p-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-xl overflow-hidden rounded-2xl border border-border bg-card shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="p-6 sm:p-7">
+          <div className="mb-3 flex items-start justify-between">
+            <div className="flex items-center gap-2 text-[10.5px] uppercase tracking-[0.14em]">
+              <span className="font-semibold text-primary">{headline.source}</span>
+              <span className="h-[3px] w-[3px] rounded-full bg-muted-foreground/40" />
+              <span className="text-muted-foreground">{headline.publishedAt}</span>
+            </div>
+            <button
+              onClick={onClose}
+              className="-mr-1 -mt-1 rounded-full px-2 py-0.5 text-[11.5px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              Close
+            </button>
+          </div>
+
+          <h2 className="font-serif text-[22px] font-semibold leading-tight text-foreground">
+            {headline.title}
+          </h2>
+
+          {headline.contextLine && (
+            <p className="mt-4 border-l-2 border-primary/40 pl-3 text-[14px] leading-relaxed text-foreground">
+              {headline.contextLine}
+            </p>
+          )}
+
+          {headline.shortSummary && headline.shortSummary !== headline.contextLine && (
+            <p className="mt-4 text-[13px] leading-relaxed text-muted-foreground">
+              {headline.shortSummary}
+            </p>
+          )}
+
+          <div className="mt-7 flex items-center justify-between border-t border-border pt-4">
+            <button
+              onClick={onToggleSave}
+              className="text-[12px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+            >
+              {isSaved ? '✓ Saved' : 'Save for later'}
+            </button>
+            <a
+              href={headline.link}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="rounded-full bg-primary px-4 py-1.5 text-[12px] font-semibold text-primary-foreground transition-opacity hover:opacity-90"
+            >
+              Read full article →
+            </a>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }

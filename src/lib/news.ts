@@ -176,25 +176,25 @@ const fetchText = async (
   url: string,
   signal: AbortSignal,
 ): Promise<{ success: true; text: string } | { success: false; error: string }> => {
+  // Always go through the worker's /api/rss proxy. It handles CORS, runs
+  // the upstream fetch from a Cloudflare data-center IP (which avoids most
+  // anti-bot blocks), and serves a 10-minute edge cache so popular feeds
+  // don't get re-fetched per user.
+  const proxied = `/api/rss?url=${encodeURIComponent(url)}`
   try {
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: { Accept: 'application/rss+xml, application/xml, text/xml' },
-      signal,
-    })
+    const response = await fetch(proxied, { signal })
     if (response.ok) return { success: true, text: await response.text() }
-    throw new Error(`HTTP ${response.status}`)
-  } catch (directError: any) {
-    if (directError.name === 'AbortError') throw directError
+    let detail = `HTTP ${response.status}`
     try {
-      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
-      const response = await fetch(proxyUrl, { signal })
-      if (response.ok) return { success: true, text: await response.text() }
-    } catch (proxyError: any) {
-      if (proxyError.name === 'AbortError') throw proxyError
-      return { success: false, error: directError.message }
+      const body = (await response.json()) as { error?: string }
+      if (body?.error) detail = body.error
+    } catch {
+      /* response wasn't JSON, keep the status */
     }
-    return { success: false, error: 'Unknown error' }
+    return { success: false, error: detail }
+  } catch (err: any) {
+    if (err?.name === 'AbortError') throw err
+    return { success: false, error: err?.message ?? 'rss proxy failed' }
   }
 }
 
@@ -513,7 +513,9 @@ Section requirements:
 Rules: Use ONLY provided titles. Never invent facts. Keep calm, neutral tone.`
 
     const text = await callOpenAI(prompt, 'You are a calm news briefing assistant. Return valid JSON only.', {
-      model: 'gpt-4o',
+      // gpt-4o-mini is 5-10× faster than gpt-4o and good enough for this
+      // synthesis task (titles + descriptions in, structured JSON out).
+      model: 'gpt-4o-mini',
       temperature: 0.4,
       maxTokens: 3000,
     })

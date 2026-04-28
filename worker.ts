@@ -294,6 +294,85 @@ app.all('/api/integrations/:name/:endpoint', async (c) => {
 })
 
 // ---------------------------------------------------------------------------
+// RSS proxy — fetch upstream feeds server-side to avoid browser CORS, and
+// cache them at the edge so popular topics don't re-fetch the same feed
+// per user. Locked to a small allowlist so this isn't an open SSRF proxy.
+// ---------------------------------------------------------------------------
+
+const ALLOWED_RSS_HOSTS = new Set([
+  'feeds.bbci.co.uk',
+  'www.reutersagency.com',
+  'techcrunch.com',
+  'www.theverge.com',
+  'www.wired.com',
+  'www.espn.com',
+  'rss.cnn.com',
+  'www.cnbc.com',
+])
+
+const RSS_CACHE_TTL_SECONDS = 600 // 10 minutes
+
+app.get('/api/rss', async (c) => {
+  const target = c.req.query('url')
+  if (!target) return c.json({ error: 'url query param is required' }, 400)
+
+  let parsed: URL
+  try {
+    parsed = new URL(target)
+  } catch {
+    return c.json({ error: 'invalid url' }, 400)
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return c.json({ error: 'protocol must be http or https' }, 400)
+  }
+  if (!ALLOWED_RSS_HOSTS.has(parsed.hostname)) {
+    return c.json({ error: `host not allowed: ${parsed.hostname}` }, 403)
+  }
+
+  // Edge cache — keyed off the canonical upstream URL so all callers share.
+  const cacheKey = new Request(`https://rss-cache.internal/?u=${encodeURIComponent(parsed.toString())}`)
+  const cache = (caches as unknown as { default: Cache }).default
+  const cached = await cache.match(cacheKey)
+  if (cached) return cached
+
+  let upstream: Response
+  try {
+    upstream = await fetch(parsed.toString(), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/rss+xml, application/xml, text/xml',
+        // Several upstream RSS hosts (Reuters, The Verge, Wired) refuse
+        // requests from Cloudflare data-center IPs unless we look like a
+        // real browser. A generic UA is enough to get through.
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+      },
+    })
+  } catch (err) {
+    console.error('[rss-proxy] upstream fetch failed:', parsed.hostname, err)
+    return c.json({ error: 'upstream fetch failed' }, 502)
+  }
+  if (!upstream.ok) {
+    return c.json({ error: `upstream ${upstream.status}` }, 502)
+  }
+
+  const body = await upstream.text()
+  const response = new Response(body, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/xml; charset=utf-8',
+      'Cache-Control': `public, max-age=${RSS_CACHE_TTL_SECONDS}, s-maxage=${RSS_CACHE_TTL_SECONDS}`,
+      'Access-Control-Allow-Origin': '*',
+    },
+  })
+
+  // Populate edge cache in the background; don't block the response.
+  c.executionCtx.waitUntil(cache.put(cacheKey, response.clone()))
+
+  return response
+})
+
+// ---------------------------------------------------------------------------
 // WebSocket routes
 // ---------------------------------------------------------------------------
 
