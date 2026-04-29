@@ -447,41 +447,40 @@ function BriefGrid({
   bulletSummaries: Record<string, string>
   onReadMoreToggle: (bulletId: string, articles: EnrichedHeadline[], event: React.MouseEvent) => void
 }) {
-  // Asymmetric layout — desktop 3-col grid:
-  //   Row 1: 01 What's happening    [span 3]   ← featured, bigger
-  //   Row 2: 02 Key players [span 2] · 03 What to watch [span 1]
-  //   Row 3: 04 Why it matters [span 1] · 05 Viewpoints [span 2]
-  // Mobile: each card stacks naturally to span 1.
+  // Original-widget layout — full-width hero + 2x2 grid for the four
+  // secondary sections. Equal-sized cards in row 2-3 prevent the visual
+  // imbalance you get when one card has more content than its neighbour.
 
-  const sections: Array<{
-    index: string
-    title: string
-    bullets: { id: string; text: string }[]
-    span: 'full' | 'wide' | 'narrow'
-    featured?: boolean
-  }> = [
-    { index: '01', title: "What's happening", bullets: brief.nowBullets, span: 'full', featured: true },
-    { index: '02', title: 'Key players', bullets: brief.stakeholdersBullets, span: 'wide' },
-    { index: '03', title: 'What to watch', bullets: brief.watchNextBullets, span: 'narrow' },
-    { index: '04', title: 'Why it matters', bullets: brief.whyItMattersBullets, span: 'narrow' },
-    { index: '05', title: 'Viewpoints', bullets: brief.viewpointsBullets, span: 'wide' },
+  const heroSection = {
+    index: '01',
+    title: "What's happening",
+    bullets: brief.nowBullets,
+    featured: true as const,
+  }
+  const secondarySections = [
+    { index: '02', title: 'Key players', bullets: brief.stakeholdersBullets },
+    { index: '03', title: 'What to watch', bullets: brief.watchNextBullets },
+    { index: '04', title: 'Why it matters', bullets: brief.whyItMattersBullets },
+    { index: '05', title: 'Viewpoints', bullets: brief.viewpointsBullets },
   ]
 
   if (briefLoading && brief.nowBullets.length === 0) {
     return (
-      <section className="mt-10 grid grid-cols-1 gap-5 sm:grid-cols-3">
-        <SkeletonCard span="full" featured />
-        <SkeletonCard span="wide" />
-        <SkeletonCard span="narrow" />
-        <SkeletonCard span="narrow" />
-        <SkeletonCard span="wide" />
+      <section className="mt-10 space-y-5">
+        <SkeletonCard featured />
+        <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
+          <SkeletonCard />
+          <SkeletonCard />
+          <SkeletonCard />
+          <SkeletonCard />
+        </div>
       </section>
     )
   }
 
   return (
     <motion.section
-      className="mt-10 grid grid-cols-1 gap-5 sm:grid-cols-3"
+      className="mt-10 space-y-5"
       initial="hidden"
       animate="visible"
       variants={{
@@ -495,28 +494,32 @@ function BriefGrid({
         },
       }}
     >
-      {sections.map((section) => (
-        <BriefSection
-          key={section.index}
-          {...section}
-          bulletArticleMap={brief.bulletArticleMap}
-          expandedBulletId={expandedBulletId}
-          loadingSummary={loadingSummary}
-          bulletSummaries={bulletSummaries}
-          onReadMoreToggle={onReadMoreToggle}
-        />
-      ))}
+      <BriefSection
+        {...heroSection}
+        bulletArticleMap={brief.bulletArticleMap}
+        expandedBulletId={expandedBulletId}
+        loadingSummary={loadingSummary}
+        bulletSummaries={bulletSummaries}
+        onReadMoreToggle={onReadMoreToggle}
+      />
+      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
+        {secondarySections.map((section) => (
+          <BriefSection
+            key={section.index}
+            {...section}
+            bulletArticleMap={brief.bulletArticleMap}
+            expandedBulletId={expandedBulletId}
+            loadingSummary={loadingSummary}
+            bulletSummaries={bulletSummaries}
+            onReadMoreToggle={onReadMoreToggle}
+          />
+        ))}
+      </div>
     </motion.section>
   )
 }
 
 // ─── Brief section card ──────────────────────────────────────────────────
-
-const SPAN_CLASS: Record<'full' | 'wide' | 'narrow', string> = {
-  full: 'sm:col-span-3',
-  wide: 'sm:col-span-2',
-  narrow: 'sm:col-span-1',
-}
 
 interface BriefSectionProps {
   index: string
@@ -527,7 +530,6 @@ interface BriefSectionProps {
   loadingSummary: string | null
   bulletSummaries: Record<string, string>
   onReadMoreToggle: (bulletId: string, articles: EnrichedHeadline[], event: React.MouseEvent) => void
-  span: 'full' | 'wide' | 'narrow'
   featured?: boolean
 }
 
@@ -540,7 +542,6 @@ function BriefSection({
   loadingSummary,
   bulletSummaries,
   onReadMoreToggle,
-  span,
   featured,
 }: BriefSectionProps) {
   if (!bullets || bullets.length === 0) return null
@@ -555,7 +556,7 @@ function BriefSection({
       transition={{ duration: 0.35, ease: SOFT_EASE }}
       className={`rounded-2xl border border-border/60 bg-card ${
         featured ? 'p-7 sm:p-8' : 'p-5 sm:p-6'
-      } ${SPAN_CLASS[span]}`}
+      }`}
     >
       <header className="mb-4 flex items-baseline gap-3">
         <span className="font-serif text-[12px] font-medium tabular-nums italic text-muted-foreground/70">
@@ -713,18 +714,12 @@ function Headlines({
 
 // ─── Skeletons ──────────────────────────────────────────────────────────
 
-function SkeletonCard({
-  span,
-  featured,
-}: {
-  span: 'full' | 'wide' | 'narrow'
-  featured?: boolean
-}) {
+function SkeletonCard({ featured }: { featured?: boolean }) {
   return (
     <div
       className={`rounded-2xl border border-border/60 bg-card ${
         featured ? 'p-7 sm:p-8' : 'p-5 sm:p-6'
-      } ${SPAN_CLASS[span]}`}
+      }`}
     >
       <div className="mb-4 h-3 w-28 animate-pulse rounded bg-muted/60" />
       <div className="space-y-2.5">
