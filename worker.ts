@@ -329,11 +329,28 @@ app.get('/api/rss', async (c) => {
     return c.json({ error: `host not allowed: ${parsed.hostname}` }, 403)
   }
 
-  // Edge cache — keyed off the canonical upstream URL so all callers share.
+  // Edge cache — keyed off the canonical upstream URL so all callers
+  // share. Defensively wrapped: in some deploy environments
+  // `caches.default` or `c.executionCtx` can be missing, and a thrown
+  // TypeError there would 500 the whole route. We treat the cache as
+  // best-effort and never let it block the response.
   const cacheKey = new Request(`https://rss-cache.internal/?u=${encodeURIComponent(parsed.toString())}`)
-  const cache = (caches as unknown as { default: Cache }).default
-  const cached = await cache.match(cacheKey)
-  if (cached) return cached
+  const cache: Cache | undefined = (() => {
+    try {
+      return (caches as unknown as { default?: Cache }).default
+    } catch {
+      return undefined
+    }
+  })()
+
+  if (cache) {
+    try {
+      const cached = await cache.match(cacheKey)
+      if (cached) return cached
+    } catch (err) {
+      console.warn('[rss-proxy] cache.match threw:', err)
+    }
+  }
 
   let upstream: Response
   try {
@@ -365,8 +382,19 @@ app.get('/api/rss', async (c) => {
     },
   })
 
-  // Populate edge cache in the background; don't block the response.
-  c.executionCtx.waitUntil(cache.put(cacheKey, response.clone()))
+  // Populate edge cache in the background; never throw on the user's
+  // request path. If `executionCtx` is unavailable, dispatch the put
+  // and forget it.
+  if (cache) {
+    const cachePut = cache.put(cacheKey, response.clone()).catch((err) => {
+      console.warn('[rss-proxy] cache.put rejected:', err)
+    })
+    try {
+      c.executionCtx?.waitUntil(cachePut)
+    } catch {
+      /* executionCtx unavailable — cachePut still runs, just unbacked */
+    }
+  }
 
   return response
 })
