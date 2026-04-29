@@ -1,29 +1,28 @@
 /**
  * News Without Doom — calm news brief.
  *
- * Pipeline:
- *   1. Hydrate from localStorage. Fresh (< 1h) entries render instantly,
- *      without touching the network.
- *   2. Otherwise fetch RSS via /api/rss (server-side, edge-cached, no CORS).
- *   3. Render the headlines list as soon as feeds parse.
- *   4. Run LLM enrichment + brief generation IN PARALLEL — neither blocks
- *      the other.
- *   5. Persist the result back to localStorage so reloads + recent-topic
- *      switches stay instant.
+ * Two modes, gated on auth state:
  *
- * Visual layer:
- *   - Per-topic accent color via inline `--color-primary` overrides on the
- *     wrapper (every existing token-driven accent auto-recolors).
- *   - Asymmetric 3-column brief grid: hero card (3 cols) → 2/1 split → 1/2
- *     split, with the featured card getting bigger type and padding.
- *   - Framer Motion: stagger fade-up on cards, AnimatePresence fade-through
- *     on topic transitions, soft hover lift, smooth modal/drawer.
+ *   Anonymous:
+ *     - Read the full headline list from RSS (free; the /api/rss proxy
+ *       is edge-cached so even bot traffic doesn't cost us anything).
+ *     - No LLM calls — no enrichment, no brief.
+ *     - Brief area shows a "Sign in to unlock the calm brief" CTA card.
+ *     - Save / Saved drawer hidden; clicking save opens AuthOverlay.
  *
- * Auth-gated by virtue of living under (protected)/.
+ *   Signed-in:
+ *     - Full pipeline: RSS → enrichment + brief in parallel via gpt-4o-mini.
+ *     - Saved articles persist in the RecordRoom DO (own-scoped RBAC).
+ *
+ * Page is intentionally PUBLIC (lives at src/pages/news.tsx, not under
+ * (protected)/) so anonymous visitors can read without sign-up friction.
+ * The integrations layer protects against billing abuse because we never
+ * call OpenAI for anonymous users.
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
+import { AuthOverlay, useAuth, useMutations, useQuery } from 'deepspace'
 import {
   TOPICS,
   FILTER_OPTIONS,
@@ -33,13 +32,13 @@ import {
   computeHeadlineSetHash,
   processHeadlineItemsWithLLM,
   applyRelevanceFilter,
+  applyToneFilter,
   generateTopicBrief,
   generateDetailedSummary,
   type EnrichedHeadline,
   type RawHeadline,
   type TopicBrief,
-  type SavedHeadline,
-} from '../../lib/news'
+} from '../lib/news'
 import {
   loadCache,
   saveCache,
@@ -47,9 +46,59 @@ import {
   formatAge,
   type TopicCache,
   type CachedTopic,
-} from '../../lib/storage'
-import { getTopicTheme, topicCssVars } from '../../lib/topic-colors'
-import NewsHeader from '../../components/NewsHeader'
+} from '../lib/storage'
+
+/**
+ * Persisted saved-item shape — what we store in the RecordRoom DO.
+ * This is a subset of EnrichedHeadline (just the fields we need for the
+ * drawer + modal); we don't bother persisting things like
+ * `descriptionSnippet`, `rssFeedUrlUsed`, etc.
+ */
+interface SavedItem {
+  itemId: string
+  title: string
+  link: string
+  source: string
+  topic: string
+  publishedAt: string
+  contextLine: string
+  shortSummary: string
+  savedAt: number
+}
+
+/** Row shape after we flatten the record envelope for the drawer. */
+interface SavedRow extends SavedItem {
+  recordId: string
+}
+
+/**
+ * Reconstruct an EnrichedHeadline from a saved row so the headline modal
+ * can render the same way it does for live items. Fields we never
+ * persisted are filled with sensible defaults.
+ */
+const savedItemToHeadline = (item: SavedItem): EnrichedHeadline => ({
+  id: item.itemId,
+  title: item.title,
+  link: item.link,
+  source: item.source,
+  topic: item.topic,
+  publishedAt: item.publishedAt,
+  publishedAtISO: '',
+  timestamp: item.savedAt,
+  descriptionSnippet: item.contextLine,
+  sourceName: item.source,
+  rssFeedUrlUsed: '',
+  fetchedAtISO: '',
+  itemUrl: item.link,
+  originalTitle: item.title,
+  originalDescriptionSnippet: item.contextLine,
+  contextLine: item.contextLine,
+  shortSummary: item.shortSummary,
+  negativity: 'low',
+  relevant: true,
+})
+import { getTopicTheme, topicCssVars } from '../lib/topic-colors'
+import NewsHeader from '../components/NewsHeader'
 
 // Soft ease-out — feels gentle, not snappy. All durations skew long-ish
 // (0.4–0.6s) so the page never feels frantic.
@@ -70,7 +119,7 @@ export default function NewsPage() {
   // ─── State ────────────────────────────────────────────────────────────
   const [cache, setCache] = useState<TopicCache>(() => loadCache())
   const [selectedTopic, setSelectedTopic] = useState<string>('Tech')
-  const [negativityFilter, setNegativityFilter] = useState<string>('Less doom')
+  const [negativityFilter, setNegativityFilter] = useState<string>('Lighter')
 
   const [items, setItems] = useState<EnrichedHeadline[]>([])
   const [brief, setBrief] = useState<TopicBrief>(EMPTY_BRIEF('Tech'))
@@ -81,7 +130,24 @@ export default function NewsPage() {
   const [forceRefreshNonce, setForceRefreshNonce] = useState(0)
 
   const [selectedHeadline, setSelectedHeadline] = useState<EnrichedHeadline | null>(null)
-  const [savedItems, setSavedItems] = useState<SavedHeadline[]>([])
+
+  // Auth state — drives the read/save split. We never call OpenAI for
+  // anonymous visitors (cost protection + zero sign-up friction for
+  // casual readers), and the save flow opens the AuthOverlay instead of
+  // attempting a write that the schema's `'own'` RBAC would reject anyway.
+  const { isSignedIn } = useAuth()
+  const [authOverlayOpen, setAuthOverlayOpen] = useState(false)
+
+  // Saved articles live in the user's RecordRoom DO. The schema's `'own'`
+  // permissions ensure each user only sees / mutates their own rows, and
+  // the SDK syncs across tabs and devices automatically over WebSocket.
+  // For anonymous users `useQuery` returns an empty record list (the DO
+  // rejects reads on the 'own' rule when there's no caller).
+  const { records: savedRecords } = useQuery<SavedItem>('savedItems', {
+    orderBy: 'createdAt',
+  })
+  const { create: createSaved, remove: removeSaved } = useMutations<SavedItem>('savedItems')
+
   const [savedDrawerOpen, setSavedDrawerOpen] = useState(false)
   const [expandedBulletId, setExpandedBulletId] = useState<string | null>(null)
   const [bulletSummaries, setBulletSummaries] = useState<Record<string, string>>({})
@@ -98,10 +164,13 @@ export default function NewsPage() {
     const signal = abortRef.current.signal
     const requestId = ++requestIdRef.current
 
-    const cached = cache[selectedTopic]
+    // Cache key includes tone filter — switching filter levels regenerates
+    // the brief from the corresponding subset of items, so each (topic,
+    // filter) combo is its own cache entry.
+    const cacheKey = `${selectedTopic}::${negativityFilter}`
+    const cached = cache[cacheKey]
     if (forceRefreshNonce === 0 && isCacheFresh(cached)) {
-      const filtered = selectHeadlines(cached.items, selectedTopic, negativityFilter).slice(0, 10)
-      setItems(filtered)
+      setItems(cached.items.slice(0, 10))
       setBrief(cached.brief)
       setFetchedAt(cached.fetchedAt)
       setUpdating(false)
@@ -113,16 +182,18 @@ export default function NewsPage() {
     setBrief(EMPTY_BRIEF(selectedTopic))
     setFetchedAt(null)
     setUpdating(true)
-    setBriefLoading(true)
+    // Anonymous users never see a brief — skip the loading skeleton too.
+    setBriefLoading(isSignedIn)
 
     runPipeline({
       topic: selectedTopic,
       filter: negativityFilter,
+      runLLM: isSignedIn,
       signal,
       isCurrent: () => requestId === requestIdRef.current,
       onItemsReady: (raw) => {
         if (requestId !== requestIdRef.current) return
-        const ranked = selectHeadlines(raw as any, selectedTopic, negativityFilter).slice(0, 10) as EnrichedHeadline[]
+        const ranked = selectHeadlines(raw as any, selectedTopic).slice(0, 10) as EnrichedHeadline[]
         setItems(ranked)
         setUpdating(false)
       },
@@ -138,7 +209,7 @@ export default function NewsPage() {
       onComplete: (cached) => {
         if (requestId !== requestIdRef.current) return
         setCache((prev) => {
-          const next = { ...prev, [selectedTopic]: cached }
+          const next = { ...prev, [cacheKey]: cached }
           saveCache(next)
           return next
         })
@@ -153,7 +224,7 @@ export default function NewsPage() {
 
     return () => abortRef.current?.abort()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTopic, negativityFilter, forceRefreshNonce])
+  }, [selectedTopic, negativityFilter, forceRefreshNonce, isSignedIn])
 
   useEffect(() => {
     setExpandedBulletId(null)
@@ -172,14 +243,42 @@ export default function NewsPage() {
     setForceRefreshNonce((n) => n + 1)
   }
 
-  const handleSave = (headline: EnrichedHeadline) => {
-    setSavedItems((prev) => {
-      const exists = prev.find((h) => h.id === headline.id)
-      if (exists) return prev.filter((h) => h.id !== headline.id)
-      return [...prev, { ...headline, savedAt: Date.now() }]
+  /** Map RSS-derived itemId -> recordId so we can remove without a re-query. */
+  const savedByItemId = useMemo(() => {
+    const map = new Map<string, { recordId: string; data: SavedItem }>()
+    for (const r of savedRecords ?? []) {
+      map.set(r.data.itemId, { recordId: r.recordId, data: r.data })
+    }
+    return map
+  }, [savedRecords])
+
+  const handleSave = async (headline: EnrichedHeadline) => {
+    // Anonymous → can't write to the DO (RBAC would reject anyway).
+    // Open the SDK's auth modal instead; once signed-in the user can
+    // re-tap save.
+    if (!isSignedIn) {
+      setAuthOverlayOpen(true)
+      return
+    }
+    const existing = savedByItemId.get(headline.id)
+    if (existing) {
+      await removeSaved(existing.recordId)
+      return
+    }
+    await createSaved({
+      itemId: headline.id,
+      title: headline.title,
+      link: headline.link,
+      source: headline.source,
+      topic: headline.topic,
+      publishedAt: headline.publishedAt,
+      contextLine: headline.contextLine ?? '',
+      shortSummary: headline.shortSummary ?? '',
+      savedAt: Date.now(),
     })
   }
-  const isSaved = (id: string) => savedItems.some((h) => h.id === id)
+
+  const isSaved = (itemId: string) => savedByItemId.has(itemId)
 
   const handleReadMoreToggle = async (
     bulletId: string,
@@ -216,10 +315,12 @@ export default function NewsPage() {
   }
 
   // ─── Derived ──────────────────────────────────────────────────────────
-  const sortedSavedItems = useMemo(
-    () => [...savedItems].sort((a, b) => (b.savedAt ?? 0) - (a.savedAt ?? 0)),
-    [savedItems],
-  )
+  /** Newest-first list for the drawer, carrying recordId for remove(). */
+  const sortedSavedItems = useMemo(() => {
+    const rows = (savedRecords ?? []).map((r) => ({ recordId: r.recordId, ...r.data }))
+    return rows.sort((a, b) => (b.savedAt ?? 0) - (a.savedAt ?? 0))
+  }, [savedRecords])
+  const savedCount = sortedSavedItems.length
   const headlines = useMemo(() => items.slice(0, 10), [items])
 
   const ageLabel = useMemo(() => {
@@ -252,8 +353,10 @@ export default function NewsPage() {
         onChangeFilter={setNegativityFilter}
         updating={updating || briefLoading}
         onRefresh={handleRefresh}
-        savedCount={savedItems.length}
+        savedCount={savedCount}
         onToggleSaved={() => setSavedDrawerOpen((v) => !v)}
+        isSignedIn={isSignedIn}
+        onSignIn={() => setAuthOverlayOpen(true)}
       />
 
       <div className="flex-1 overflow-y-auto">
@@ -279,20 +382,28 @@ export default function NewsPage() {
                 )}
               </div>
 
-              {/* Hero takeaway */}
-              <Hero topic={selectedTopic} brief={brief} loading={briefLoading} />
+              {/* Hero takeaway (signed-in) or simple title (anon) */}
+              {isSignedIn ? (
+                <Hero topic={selectedTopic} brief={brief} loading={briefLoading} />
+              ) : (
+                <AnonymousHero topic={selectedTopic} />
+              )}
 
-              {/* Asymmetric brief grid */}
-              <BriefGrid
-                brief={brief}
-                briefLoading={briefLoading}
-                expandedBulletId={expandedBulletId}
-                loadingSummary={loadingSummary}
-                bulletSummaries={bulletSummaries}
-                onReadMoreToggle={handleReadMoreToggle}
-              />
+              {/* Brief grid for signed-in users; sign-in CTA for anonymous */}
+              {isSignedIn ? (
+                <BriefGrid
+                  brief={brief}
+                  briefLoading={briefLoading}
+                  expandedBulletId={expandedBulletId}
+                  loadingSummary={loadingSummary}
+                  bulletSummaries={bulletSummaries}
+                  onReadMoreToggle={handleReadMoreToggle}
+                />
+              ) : (
+                <SignInCta onSignIn={() => setAuthOverlayOpen(true)} />
+              )}
 
-              {/* Top headlines */}
+              {/* Top headlines (always visible) */}
               <Headlines
                 headlines={headlines}
                 onOpenItem={setSelectedHeadline}
@@ -303,15 +414,18 @@ export default function NewsPage() {
       </div>
 
       <AnimatePresence>
-        {savedDrawerOpen && (
+        {savedDrawerOpen && isSignedIn && (
           <SavedDrawer
             items={sortedSavedItems}
             onClose={() => setSavedDrawerOpen(false)}
-            onOpenItem={(item) => setSelectedHeadline(item)}
-            onRemove={handleSave}
+            onOpenItem={(item) => setSelectedHeadline(savedItemToHeadline(item))}
+            onRemove={(item) => removeSaved(item.recordId)}
           />
         )}
       </AnimatePresence>
+
+      {/* Auth overlay — opened from save attempts or the CTA card */}
+      {authOverlayOpen && <AuthOverlay onClose={() => setAuthOverlayOpen(false)} />}
       <AnimatePresence>
         {selectedHeadline && (
           <HeadlineModal
@@ -331,7 +445,12 @@ export default function NewsPage() {
 
 interface PipelineDeps {
   topic: string
+  /** Tone filter — applied AFTER enrichment so items have negativity
+   *  scores to match against. */
   filter: string
+  /** Whether to run the LLM enrichment + brief steps. False = anonymous
+   *  user, in which case we just render raw RSS as the headline list. */
+  runLLM: boolean
   signal: AbortSignal
   isCurrent: () => boolean
   onItemsReady: (items: RawHeadline[]) => void
@@ -342,7 +461,7 @@ interface PipelineDeps {
 }
 
 async function runPipeline(deps: PipelineDeps) {
-  const { topic, filter, signal, isCurrent, onItemsReady, onEnriched, onBrief, onComplete, onError } = deps
+  const { topic, filter, runLLM, signal, isCurrent, onItemsReady, onEnriched, onBrief, onComplete, onError } = deps
   try {
     const { items: raw } = await fetchTopicFeeds(topic, signal)
     if (!isCurrent()) return
@@ -369,28 +488,153 @@ async function runPipeline(deps: PipelineDeps) {
     })
     onItemsReady(sorted)
 
-    const filtered = selectHeadlines(sorted as any, topic, filter).slice(0, 10) as RawHeadline[]
+    if (!runLLM) {
+      // Anonymous mode — no enrichment, no brief, no LLM cost. The page
+      // already rendered the raw headlines via `onItemsReady`; nothing
+      // else to do. Skip onComplete so we don't write a half-empty
+      // entry into the cache.
+      return
+    }
 
-    const [enrichedRaw, brief] = await Promise.all([
-      processHeadlineItemsWithLLM(filtered, topic, signal),
-      generateTopicBrief(filtered as unknown as EnrichedHeadline[], topic, signal),
-    ])
+    // Take a slightly bigger candidate set (15) so the post-enrichment
+    // tone filter still has enough material to keep ~10 items even when
+    // strict ("Calm only") removes some.
+    const candidates = selectHeadlines(sorted as any, topic).slice(0, 15) as RawHeadline[]
+
+    // 1. Enrich first — this is what gives every item a negativity
+    //    score, without which the tone filter has nothing to match.
+    const enrichedRaw = await processHeadlineItemsWithLLM(candidates, topic, signal)
     if (!isCurrent()) return
 
-    // Drop items the LLM judged off-topic (e.g. a film article in
-    // Science from The Verge's all-content feed). Backstops to the
-    // unfiltered set if too few items remain.
-    const enriched = applyRelevanceFilter(enrichedRaw)
+    // 2. Apply relevance filter (drop off-topic noise from catch-all
+    //    feeds), then the user's tone filter, then trim to top 10.
+    const filtered = applyToneFilter(applyRelevanceFilter(enrichedRaw), filter).slice(0, 10)
 
-    onEnriched(enriched)
+    onEnriched(filtered)
+
+    // 3. Generate the brief from the FILTERED set so it reflects the
+    //    chosen tone. (Was previously running in parallel with
+    //    enrichment, which made the brief tone-agnostic.)
+    const brief = await generateTopicBrief(filtered, topic, signal)
+    if (!isCurrent()) return
+
     onBrief(brief)
-
-    onComplete({ brief, items: enriched, fetchedAt: Date.now() })
+    onComplete({ brief, items: filtered, fetchedAt: Date.now() })
   } catch (err: any) {
     if (err?.name === 'AbortError') return
     console.error('[news-pipeline] failed:', err)
     onError()
   }
+}
+
+// ─── Anonymous hero + sign-in CTA ────────────────────────────────────────
+
+/**
+ * Lightweight hero for signed-out users — same visual rhythm as `Hero`
+ * (small accent bar + topic label + serif headline) but without an
+ * LLM-derived takeaway. Sets reading expectations and primes the eye for
+ * the headline list below.
+ */
+function AnonymousHero({ topic }: { topic: string }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.55, ease: SOFT_EASE, delay: 0.05 }}
+    >
+      <div className="mb-3 flex items-center gap-2.5">
+        <motion.span
+          layoutId="hero-accent-bar"
+          className="block h-[2px] w-8 rounded-full"
+          style={{ backgroundColor: 'var(--color-primary)' }}
+          transition={{ duration: 0.6, ease: SOFT_EASE }}
+        />
+        <span
+          className="text-[10.5px] font-medium uppercase tracking-[0.22em]"
+          style={{ color: 'var(--color-primary)' }}
+        >
+          {topic.toUpperCase()} HEADLINES
+        </span>
+      </div>
+      <h1 className="font-serif text-[30px] leading-tight text-foreground sm:text-[40px]">
+        Today’s {topic.toLowerCase()} stories, gathered from trusted sources.
+      </h1>
+    </motion.div>
+  )
+}
+
+/**
+ * Big, friendly CTA card that fills the brief slot for anonymous users.
+ * Tells them what they're missing (calm AI brief + saved articles) and
+ * gives a single primary action that opens `<AuthOverlay>`.
+ */
+function SignInCta({ onSignIn }: { onSignIn: () => void }) {
+  return (
+    <motion.section
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.55, ease: SOFT_EASE, delay: 0.15 }}
+      className="relative mt-10 overflow-hidden rounded-2xl border bg-card p-7 sm:p-9"
+      style={{
+        borderColor: 'var(--color-primary-border)',
+        backgroundImage:
+          'linear-gradient(135deg, var(--color-primary-muted) 0%, transparent 60%)',
+      }}
+    >
+      <div className="flex items-center gap-2.5">
+        <motion.span
+          aria-hidden
+          className="block h-[2px] w-8 rounded-full"
+          style={{ backgroundColor: 'var(--color-primary)' }}
+        />
+        <span
+          className="text-[10.5px] font-medium uppercase tracking-[0.22em]"
+          style={{ color: 'var(--color-primary)' }}
+        >
+          With an account
+        </span>
+      </div>
+      <h2 className="mt-3 font-serif text-[22px] font-semibold leading-snug text-foreground sm:text-[26px]">
+        Sign in to unlock the daily brief and your reading list.
+      </h2>
+      <ul className="mt-5 space-y-2.5 text-[13.5px] leading-relaxed text-muted-foreground">
+        <li className="flex items-start gap-2.5">
+          <span
+            className="mt-[7px] h-1 w-1 shrink-0 rounded-full"
+            style={{ backgroundColor: 'var(--color-primary)' }}
+          />
+          A structured daily brief — what’s happening, key players, what to watch, why it matters, and contrasting viewpoints.
+        </li>
+        <li className="flex items-start gap-2.5">
+          <span
+            className="mt-[7px] h-1 w-1 shrink-0 rounded-full"
+            style={{ backgroundColor: 'var(--color-primary)' }}
+          />
+          A reading list that follows you across every device you sign in on.
+        </li>
+        <li className="flex items-start gap-2.5">
+          <span
+            className="mt-[7px] h-1 w-1 shrink-0 rounded-full"
+            style={{ backgroundColor: 'var(--color-primary)' }}
+          />
+          A tone filter — show every headline, hide negative ones, or stay calm only.
+        </li>
+      </ul>
+      <div className="mt-6 flex items-center gap-3">
+        <motion.button
+          onClick={onSignIn}
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
+          transition={{ duration: 0.25, ease: SOFT_EASE }}
+          className="rounded-full px-5 py-2 text-[13px] font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90"
+          style={{ backgroundColor: 'var(--color-primary)' }}
+        >
+          Sign in or sign up
+        </motion.button>
+        <span className="text-[12px] text-muted-foreground">Free — takes about 10 seconds.</span>
+      </div>
+    </motion.section>
+  )
 }
 
 // ─── Hero takeaway ───────────────────────────────────────────────────────
@@ -758,10 +1002,10 @@ function SavedDrawer({
   onOpenItem,
   onRemove,
 }: {
-  items: SavedHeadline[]
+  items: SavedRow[]
   onClose: () => void
-  onOpenItem: (item: SavedHeadline) => void
-  onRemove: (item: SavedHeadline) => void
+  onOpenItem: (item: SavedRow) => void
+  onRemove: (item: SavedRow) => void
 }) {
   return (
     <motion.div
@@ -785,7 +1029,7 @@ function SavedDrawer({
             <div>
               <h2 className="font-serif text-[22px] font-semibold text-foreground">Saved for later</h2>
               <p className="mt-0.5 text-[12px] text-muted-foreground">
-                {items.length} {items.length === 1 ? 'article' : 'articles'} · ephemeral, cleared on reload
+                {items.length} {items.length === 1 ? 'article' : 'articles'}
               </p>
             </div>
             <button
@@ -803,7 +1047,7 @@ function SavedDrawer({
           ) : (
             <ul className="divide-y divide-border/60">
               {items.map((item) => (
-                <li key={item.id} className="flex items-start justify-between gap-4 py-3">
+                <li key={item.recordId} className="flex items-start justify-between gap-4 py-3">
                   <button onClick={() => onOpenItem(item)} className="flex-1 min-w-0 text-left">
                     <div
                       className="mb-0.5 text-[10.5px] uppercase tracking-[0.14em]"

@@ -14,7 +14,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { signOut, useUser } from 'deepspace'
+import { signOut, useAuth, useUser } from 'deepspace'
 import { getTopicTheme } from '../lib/topic-colors'
 
 interface NewsHeaderProps {
@@ -31,6 +31,10 @@ interface NewsHeaderProps {
 
   savedCount: number
   onToggleSaved: () => void
+
+  /** When falsy, header swaps Saved + UserMenu for a single Sign-in pill. */
+  isSignedIn: boolean
+  onSignIn: () => void
 }
 
 const SOFT_EASE = [0.16, 1, 0.3, 1] as const
@@ -46,6 +50,8 @@ export default function NewsHeader({
   onRefresh,
   savedCount,
   onToggleSaved,
+  isSignedIn,
+  onSignIn,
 }: NewsHeaderProps) {
   const theme = getTopicTheme(selectedTopic)
 
@@ -69,8 +75,14 @@ export default function NewsHeader({
         </Link>
         <div className="flex shrink-0 items-center gap-2">
           <RefreshButton updating={updating} onClick={onRefresh} />
-          <SavedButton count={savedCount} onClick={onToggleSaved} />
-          <UserMenu />
+          {isSignedIn ? (
+            <>
+              <SavedButton count={savedCount} onClick={onToggleSaved} />
+              <UserMenu />
+            </>
+          ) : (
+            <SignInPill onClick={onSignIn} />
+          )}
         </div>
       </div>
 
@@ -115,36 +127,45 @@ export default function NewsHeader({
           })}
         </nav>
 
-        <div
-          className="ml-auto flex shrink-0 items-center gap-0.5 rounded-full bg-secondary p-0.5"
-          role="radiogroup"
-          aria-label="Doom filter"
-        >
-          {filterOptions.map((option) => {
-            const isActive = negativityFilter === option
-            return (
-              <button
-                key={option}
-                onClick={() => onChangeFilter(option)}
-                role="radio"
-                aria-checked={isActive}
-                className="relative shrink-0 rounded-full px-3 py-0.5 text-[11px] font-medium transition-colors"
-                style={{
-                  color: isActive ? 'var(--color-foreground)' : 'var(--color-muted-foreground)',
-                }}
-              >
-                {isActive && (
-                  <motion.span
-                    layoutId="filter-pill"
-                    className="absolute inset-0 rounded-full bg-card shadow-sm"
-                    transition={{ type: 'spring', stiffness: 280, damping: 30, mass: 0.9 }}
-                  />
-                )}
-                <span className="relative">{option}</span>
-              </button>
-            )
-          })}
-        </div>
+        {isSignedIn && (
+          <div
+            className="ml-auto flex shrink-0 items-center gap-0.5 rounded-full bg-secondary p-0.5"
+            role="radiogroup"
+            aria-label="Tone filter"
+          >
+            {filterOptions.map((option) => {
+              const isActive = negativityFilter === option
+              return (
+                <button
+                  key={option}
+                  onClick={() => onChangeFilter(option)}
+                  role="radio"
+                  aria-checked={isActive}
+                  title={
+                    option === 'All'
+                      ? 'Show every headline'
+                      : option === 'Lighter'
+                        ? 'Hide highly-negative items'
+                        : 'Only show light, neutral items'
+                  }
+                  className="relative shrink-0 rounded-full px-3 py-0.5 text-[11px] font-medium transition-colors"
+                  style={{
+                    color: isActive ? 'var(--color-foreground)' : 'var(--color-muted-foreground)',
+                  }}
+                >
+                  {isActive && (
+                    <motion.span
+                      layoutId="filter-pill"
+                      className="absolute inset-0 rounded-full bg-card shadow-sm"
+                      transition={{ type: 'spring', stiffness: 280, damping: 30, mass: 0.9 }}
+                    />
+                  )}
+                  <span className="relative">{option}</span>
+                </button>
+              )
+            })}
+          </div>
+        )}
       </div>
     </header>
   )
@@ -176,6 +197,23 @@ function RefreshButton({ updating, onClick }: { updating: boolean; onClick: () =
         <path d="M3 12a9 9 0 0 0 15.5 6.4L21 16" />
         <path d="M21 21v-5h-5" />
       </svg>
+    </motion.button>
+  )
+}
+
+// ─── Sign-in pill (anonymous users) ──────────────────────────────────────
+
+function SignInPill({ onClick }: { onClick: () => void }) {
+  return (
+    <motion.button
+      onClick={onClick}
+      whileHover={{ scale: 1.03 }}
+      whileTap={{ scale: 0.97 }}
+      transition={{ duration: 0.25, ease: SOFT_EASE }}
+      className="flex h-9 items-center gap-1.5 rounded-full px-4 text-[12.5px] font-semibold text-primary-foreground shadow-sm transition-opacity hover:opacity-90"
+      style={{ backgroundColor: 'var(--color-primary)' }}
+    >
+      Sign in
     </motion.button>
   )
 }

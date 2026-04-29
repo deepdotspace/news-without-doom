@@ -70,12 +70,17 @@ export interface SavedHeadline extends EnrichedHeadline {
 export const TOPICS = ['Tech', 'Business', 'Science', 'Markets', 'Sports', 'Local'] as const
 
 /**
- * Negativity filter labels — on-brand and self-explanatory:
- *   - "All"       → no filter, show everything
- *   - "Less doom" → hide highly-negative items
- *   - "No doom"   → only show items the LLM scored as low-negativity
+ * Tone filter labels:
+ *   - "All"        → no filter, show everything
+ *   - "Lighter"    → hide highly-negative items (medium + low pass)
+ *   - "Calm only"  → only show items the LLM scored as low-negativity
+ *
+ * The filter is applied at DISPLAY TIME on enriched items, not in
+ * `selectHeadlines`. This avoids accidentally filtering away every raw
+ * pre-enrichment item (which has no `negativity` set yet) when the user
+ * picks the strictest setting.
  */
-export const FILTER_OPTIONS = ['All', 'Less doom', 'No doom'] as const
+export const FILTER_OPTIONS = ['All', 'Lighter', 'Calm only'] as const
 export type FilterOption = (typeof FILTER_OPTIONS)[number]
 
 /**
@@ -368,17 +373,13 @@ export const deduplicateItems = <T extends { id: string }>(items: T[]): T[] => {
  *  lower-frequency but more topical sources like BBC Science. */
 const PER_SOURCE_QUOTA = 3
 
-export const selectHeadlines = <T extends { topic: string; source: string; negativity?: string; timestamp: number; title: string }>(
+export const selectHeadlines = <T extends { topic: string; source: string; timestamp: number; title: string }>(
   items: T[],
   topic: string,
-  negativityFilter: string,
 ): T[] => {
   let filtered = items.filter((i) => i.topic === topic)
   const sources = sanitizeSources(null)
   filtered = filtered.filter((i) => sources.includes(i.source))
-
-  if (negativityFilter === 'Less doom') filtered = filtered.filter((i) => i.negativity !== 'high')
-  else if (negativityFilter === 'No doom') filtered = filtered.filter((i) => i.negativity === 'low')
 
   filtered.sort((a, b) => {
     if (a.timestamp !== b.timestamp) return b.timestamp - a.timestamp
@@ -565,6 +566,38 @@ export const applyRelevanceFilter = (
   const relevant = enriched.filter((item) => item.relevant)
   if (relevant.length >= minKeep) return relevant
   return enriched
+}
+
+/**
+ * Tone (doom) filter — applied at display time on enriched items.
+ *
+ * If the result would leave fewer than `minKeep` items, we silently fall
+ * back to the unfiltered list. This prevents the "stuck on Calm only"
+ * behaviour where a strict filter could empty a topic entirely (e.g.
+ * pre-enrichment items have no `negativity` yet, or the LLM happens to
+ * score every item as medium/high).
+ */
+export const applyToneFilter = <T extends { negativity?: string }>(
+  items: T[],
+  filter: string,
+  minKeep = 3,
+): T[] => {
+  if (filter === 'All' || items.length === 0) return items
+
+  // Items still missing a negativity score (pre-enrichment, or the
+  // anonymous render path) can't be tone-filtered — let them through.
+  const scored = items.filter((i) => i.negativity !== undefined)
+  if (scored.length === 0) return items
+
+  let kept: T[] = items
+  if (filter === 'Lighter') {
+    kept = items.filter((i) => i.negativity === undefined || i.negativity !== 'high')
+  } else if (filter === 'Calm only') {
+    kept = items.filter((i) => i.negativity === 'low')
+  }
+
+  if (kept.length >= minKeep) return kept
+  return items
 }
 
 export const generateTopicBrief = async (
