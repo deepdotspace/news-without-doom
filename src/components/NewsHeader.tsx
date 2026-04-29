@@ -52,18 +52,21 @@ export default function NewsHeader({
   return (
     <header className="sticky top-0 z-30 bg-background/80 backdrop-blur-xl">
       {/* Masthead row */}
-      <div className="mx-auto flex max-w-5xl items-end justify-between gap-6 px-5 pt-5 pb-3 sm:px-8 sm:pt-6">
-        <div>
-          <Link
-            to="/news"
-            className="block font-serif text-[19px] font-bold leading-none tracking-tight text-foreground sm:text-[22px]"
+      <div className="mx-auto flex max-w-5xl items-center justify-between gap-6 px-5 py-4 sm:px-8 sm:py-5">
+        <Link
+          to="/news"
+          className="group inline-flex items-baseline font-serif text-[22px] leading-none tracking-tight text-foreground sm:text-[26px]"
+          aria-label="News Without Doom — home"
+        >
+          <span className="font-bold">News</span>
+          <span
+            aria-hidden
+            className="mx-[0.25em] font-normal italic text-muted-foreground transition-colors group-hover:text-[color:var(--color-primary)]"
           >
-            News Without Doom
-          </Link>
-          <p className="mt-2 font-serif text-[11.5px] italic text-muted-foreground">
-            Today’s headlines — calmly delivered.
-          </p>
-        </div>
+            without
+          </span>
+          <span className="font-bold">Doom</span>
+        </Link>
         <div className="flex shrink-0 items-center gap-2">
           <RefreshButton updating={updating} onClick={onRefresh} />
           <SavedButton count={savedCount} onClick={onToggleSaved} />
