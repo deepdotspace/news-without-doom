@@ -7,7 +7,7 @@ main = "worker.ts"
 directory = "dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-run_worker_first = ["/api/*", "/ws/*", "/internal/*", "/_deepspace/*"]
+run_worker_first = ["/api/*", "/ws/*", "/internal/*", "/v1/*", "/_deepspace/*"]
 
 [[migrations]]
 tag = "v1"
@@ -27,8 +27,12 @@ bindings = [
   { name = "CRON_ROOMS", class_name = "AppCronRoom" },
 ]
 
+# Deploy subdomain is `name = "news"` (→ news.app.space), but the app's data
+# scope stays "news-without-doom" to match src/constants.ts SCOPE_ID and the
+# existing RecordRoom data created under app:news-without-doom. Do not change
+# this to "news" without migrating that data.
 [vars]
-APP_NAME = "news"
+APP_NAME = "news-without-doom"
 
 [dev]
 port = 8780

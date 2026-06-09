@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "deepspace": {
+      "source": "deepdotspace/deepspace-skill",
+      "sourceType": "github",
+      "skillPath": "skills/deepspace/SKILL.md",
+      "computedHash": "80c1fbf02a54be6b0d2d990d1daa90a15faaf217d4f5ed21730e297298500aaa"
+    }
+  }
+}
