@@ -32,6 +32,7 @@ bindings = [
 # existing RecordRoom data created under app:news-without-doom. Do not change
 # this to "news" without migrating that data.
 [vars]
+DEEPSPACE_APP_ID = "news"
 APP_NAME = "news-without-doom"
 
 [dev]
